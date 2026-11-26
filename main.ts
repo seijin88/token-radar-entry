@@ -1,3 +1,4 @@
+// Built by PI agent 2026-11-26T18:51:37Z
 // Token Radar: a pre-token launch radar for the DefiLlama protocol universe.
 //
 // The program reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>), scores every
