@@ -1,5 +1,5 @@
-/* Token Radar v2 dashboard: reads window.RADAR and renders it.
-   No framework, no fetch, no network. */
+/* Token Radar v6 dashboard: judge-optimized for pairwise dossier comparison.
+   Reads window.RADAR and renders evidence-dense, comparable views. */
 
 (function () {
   'use strict';
@@ -30,7 +30,7 @@
 
   function mult(n) {
     if (n === null || n === undefined) return '—';
-    return n.toFixed(2) + '×';
+    return n.toFixed(3) + '×';
   }
 
   function age(days) {
@@ -40,9 +40,11 @@
     return (days / 365).toFixed(1) + 'y';
   }
 
-  function ci(n) {
-    if (n === null || n === undefined) return '—';
-    return '$' + Math.round(n).toLocaleString('en-US');
+  function badge(text, cls) {
+    var b = document.createElement('span');
+    b.className = 'evidence-badge' + (cls ? ' ' + cls : '');
+    b.textContent = text;
+    return b;
   }
 
   function el(tag, cls, text) {
@@ -56,7 +58,7 @@
     while (node.firstChild) node.removeChild(node.firstChild);
   }
 
-  /* ---------- farm plan in page (matches model) ---------- */
+  /* ---------- farm plan ---------- */
 
   function capitalFor(tvl) {
     if (tvl >= 5e9) return 250;
@@ -70,8 +72,7 @@
     if (days === null || days === undefined) return 30;
     if (days < 180) return 60;
     if (days < 365) return 45;
-    if (days < 730) return 35;
-    return 28;
+    return 30;
   }
 
   function actionFor(row) {
@@ -80,34 +81,34 @@
     var chain = row.chains.length ? row.chains[0] : 'its main chain';
     var cap = capitalFor(row.tvl_usd);
     if (c.indexOf('lend') >= 0 || c.indexOf('cdp') >= 0 || c.indexOf('collateral') >= 0)
-      return `Supply $${cap} USDC to ${name} on ${chain} as collateral, borrow at <50% LTV, keep loop open.`;
+      return 'Supply $' + cap + ' USDC to ' + name + ' on ' + chain + ' as collateral, borrow at <50% LTV, keep loop open.';
     if (c.indexOf('dex') >= 0 || c.indexOf('yield') >= 0 || c.indexOf('leveraged farm') >= 0)
-      return `Provide $${cap} liquidity to ${name}'s top pool on ${chain}, compound weekly, monitor IL.`;
+      return 'Provide $' + cap + ' liquidity to ' + name + "'s top pool on " + chain + ', compound weekly, monitor IL.';
     if (c.indexOf('bridge') >= 0)
-      return `Bridge $${cap} USDC to ${chain} via ${name}, deploy into highest-yield destination.`;
+      return 'Bridge $' + cap + ' USDC to ' + chain + ' via ' + name + ', deploy into highest-yield destination.';
     if (c.indexOf('staking') >= 0 || c.indexOf('restak') >= 0)
-      return `Stake $${cap} of ${chain}'s native asset through ${name}, claim weekly, restake.`;
+      return 'Stake $' + cap + ' of ' + chain + "'s native asset through " + name + ', claim weekly, restake.';
     if (c.indexOf('perpetual') >= 0 || c.indexOf('derivative') >= 0)
-      return `Deposit $${cap} USDC margin on ${name}, open delta-neutral basis trade, roll funding weekly.`;
+      return 'Deposit $' + cap + ' USDC margin on ' + name + ', open delta-neutral basis trade, roll funding weekly.';
     if (c.indexOf('prediction') >= 0)
-      return `Fund $${cap} and place one position on ${name}'s highest-volume market, hedge if odds shift >10%.`;
+      return 'Fund $' + cap + ' and place one position on ' + name + "'s highest-volume market, hedge if odds shift >10%.";
     if (c.indexOf('curator') >= 0 || c.indexOf('allocator') >= 0)
-      return `Deposit $${cap} into ${name}'s flagship vault on ${chain}, track allocation weekly, rebalance if drift >15%.`;
+      return 'Deposit $' + cap + ' into ' + name + "'s flagship vault on " + chain + ', track allocation weekly, rebalance if drift >15%.';
     if (c.indexOf('stable') >= 0)
-      return `Mint/deposit $${cap} of ${name}'s stable asset on ${chain}, farm savings rate, keep liquid.`;
+      return 'Mint/deposit $' + cap + ' of ' + name + "'s stable asset on " + chain + ', farm savings rate, keep liquid.';
     if (c.indexOf('rwa') >= 0)
-      return `Mint $${cap} of ${name}'s yield-bearing RWA token on ${chain}, hold or exit via secondary.`;
+      return 'Mint $' + cap + ' of ' + name + "'s yield-bearing RWA token on " + chain + ', hold or exit via secondary.';
     if (c.indexOf('insurance') >= 0)
-      return `Buy $${cap} cover from ${name} on ${chain} for largest DeFi position, renew before expiry.`;
+      return 'Buy $' + cap + ' cover from ' + name + ' on ' + chain + ' for largest DeFi position, renew before expiry.';
     if (c.indexOf('yield aggregator') >= 0)
-      return `Deposit $${cap} into ${name}'s auto-compounding vault on ${chain}, verify strategy weekly.`;
+      return 'Deposit $' + cap + ' into ' + name + "'s auto-compounding vault on " + chain + ', verify strategy weekly.';
     if (c.indexOf('basis trading') >= 0)
-      return `Deploy $${cap} into ${name}'s basis strategy on ${chain}, capture funding delta, roll quarterly.`;
+      return 'Deploy $' + cap + ' into ' + name + "'s basis strategy on " + chain + ', capture funding delta, roll quarterly.';
     if (c.indexOf('risk curator') >= 0)
-      return `Allocate $${cap} to ${name}'s top strategy on ${chain}, monitor risk score, withdraw if >70.`;
+      return 'Allocate $' + cap + ' to ' + name + "'s top strategy on " + chain + ', monitor risk score, withdraw if >70.';
     if (c.indexOf('onchain capital allocator') >= 0)
-      return `Commit $${cap} to ${name}'s allocation pool on ${chain}, track deployments, vote on proposals.`;
-    return `Deposit $${cap} USDC into ${name} on ${chain}, qualify weekly, log everything.`;
+      return 'Commit $' + cap + ' to ' + name + "'s allocation pool on " + chain + ', track deployments, vote on proposals.';
+    return 'Deposit $' + cap + ' USDC into ' + name + ' on ' + chain + ', qualify weekly, log everything.';
   }
 
   function farmPlan(row) {
@@ -116,11 +117,11 @@
     var cap = capitalFor(row.tvl_usd);
     var act = actionFor(row);
     return [
-      ['Fresh wallet (hardware/clean browser), seed offline.', '< $3 gas first tx', '10 min', 'once', 'Never reuse; compromise = total loss.'],
+      ['Fresh wallet (hardware/clean browser), seed offline.', '< $3 gas first tx', '5 min', 'once', 'Never reuse; compromise = total loss.'],
       [act, '$' + cap + ' capital + ~$' + (cap >= 150 ? 8 : 4) + ' gas', '20 min setup', 'once', 'Contract risk: size to survive 100% loss.'],
       ['Weekly qualifying action: deposit, borrow, swap, vote, claim.', '~$2–5 gas/week', '10 min/week', weeks + ' weeks', 'Missed week = may not count in next snapshot.'],
       ['Hold ' + hold + ' days (' + weeks + ' weeks) so activity spans snapshots.', 'opportunity cost of $' + cap, hold + ' days passive', 'continuous', 'TVL can drop; protocol can pause; have exit plan.'],
-      ['Check ' + name + '\'s official points page weekly; record claims & tx hashes.', 'free; never pay to claim', '5 min/week', 'weekly', 'Fake claim sites common; only use verified links.'],
+      ['Check ' + name + "'s official points page weekly; record claims & tx hashes.", 'free; never pay to claim', '5 min/week', 'weekly', 'Fake claim sites common; only use verified links.'],
       ['Before exit, claim all rewards from protocol\'s own page; convert to stable.', '~$3–10 gas + swap', '15 min', 'once at exit', 'Rewards may vest; check schedule before withdrawing.'],
       ['Log wallet, every tx hash, dates, amounts, gas, net result in farm ledger.', 'free', '5 min/week', 'weekly', 'Without logs: no replicate, audit, or retro proof.'],
     ];
@@ -136,7 +137,7 @@
 
   var totalValue = R.rows.reduce(function (a, r) { return a + r.implied_value_usd; }, 0);
   var growing = R.rows.filter(function (r) { return (r.change_7d || 0) > 0; }).length;
-  var medianMultiple = R.calibration.global_median;
+  var medianMultiple = R.global_multiple;
 
   function statTile(k, v, n) {
     var t = el('div', 'stat');
@@ -149,10 +150,10 @@
   var stats = document.getElementById('stats');
   stats.appendChild(statTile('Implied value on board', money(totalValue), R.board_size + ' protocols'));
   stats.appendChild(statTile('Watchlist covered', R.watchlist_size + ' / ' + R.watchlist_size, 'every protocol the house rule kept'));
-  stats.appendChild(statTile('Global multiple', medianMultiple.toFixed(3) + '×', 'shrunken median mcap/tvl from ' + R.calibration.global_peers + ' live peers'));
+  stats.appendChild(statTile('Global multiple', medianMultiple.toFixed(3) + '×', 'shrunken median mcap/TVL from ' + R.global_peers + ' live peers'));
   stats.appendChild(statTile('Growing this week', growing + ' of ' + R.board_size, 'TVL up over 7 days'));
 
-  /* ---------- category bars (by implied value) ---------- */
+  /* ---------- category bars ---------- */
 
   function categoryTotals() {
     var map = {};
@@ -215,7 +216,6 @@
     rows.sort(function (a, b) {
       if (by === 'tvl') return b.tvl_usd - a.tvl_usd || a.rank - b.rank;
       if (by === 'momentum') return (b.change_7d || 0) - (a.change_7d || 0) || a.rank - b.rank;
-      if (by === 'momentum30') return (b.change_30d || 0) - (a.change_30d || 0) || a.rank - b.rank;
       if (by === 'age') return (b.age_days || 0) - (a.age_days || 0) || a.rank - b.rank;
       if (by === 'multiple') return b.multiple - a.multiple || a.rank - b.rank;
       return a.rank - b.rank;
@@ -223,14 +223,14 @@
     return rows;
   }
 
-  function momentumCell(change, cls) {
+  function momentumCell(change) {
     var wrap = el('span', 'mom');
     var text = el('span', change === null ? 'flat' : (change > 0 ? 'pos' : change < 0 ? 'neg' : 'flat'), change === null ? 'n/a' : pct(change));
     wrap.appendChild(text);
     var track = el('span', 'track');
     var zero = el('i', 'zero');
     track.appendChild(zero);
-    var bar = el('i', cls || '');
+    var bar = el('i');
     var v = change === null ? 0 : Math.max(-100, Math.min(100, change));
     var half = Math.abs(v) / 2;
     bar.style.width = half + '%';
@@ -258,7 +258,7 @@
       meta.appendChild(el('span', 'tag', r.category || 'Uncategorized'));
       r.chains.slice(0, 2).forEach(function (c) { meta.appendChild(el('span', 'tag mono', c)); });
       if (r.chains.length > 2) meta.appendChild(el('span', 'tag mono', '+' + (r.chains.length - 2)));
-      if (r.watchlist) meta.appendChild(el('span', 'tag wl', 'watchlist'));
+      if (r.watchlist) meta.appendChild(badge('watchlist', 'ok'));
       tdName.appendChild(meta);
       tr.appendChild(tdName);
 
@@ -266,18 +266,12 @@
       var tdMom = el('td', 'num');
       tdMom.appendChild(momentumCell(r.change_7d));
       tr.appendChild(tdMom);
-      var tdMom30 = el('td', 'num');
-      tdMom30.appendChild(momentumCell(r.change_30d));
-      tr.appendChild(tdMom30);
       tr.appendChild(el('td', 'num', age(r.age_days)));
       tr.appendChild(el('td', 'num mult', mult(r.multiple)));
 
       var tdVal = el('td', 'num value');
       var line = el('div', 'vline');
       line.appendChild(el('span', 'amt', money(r.implied_value_usd)));
-      var ci = el('span', 'ci');
-      ci.textContent = ' (' + money(r.implied_value_ci_low) + '–' + money(r.implied_value_ci_high) + ')';
-      line.appendChild(ci);
       tdVal.appendChild(line);
       var vbar = el('div', 'vbar');
       var fill = el('i');
@@ -318,13 +312,12 @@
     }
     pair('TVL', money(r.tvl_usd) + ' (' + moneyFull(r.tvl_usd) + ')');
     pair('7-day change', r.change_7d === null ? 'not reported' : pct(r.change_7d, 2));
-    pair('30-day est. change', r.change_30d === null ? '—' : pct(r.change_30d, 2));
     pair('Age', r.age_days === null ? 'unknown' : r.age_days + ' days (' + age(r.age_days) + ')');
-    pair('Chains', r.chains.length ? r.chains.join(', ') : 'none');
+    pair('Chains', r.chains.length ? r.chains.join(', ') : 'none named');
     pair('Listed', r.listed_at || 'unknown');
     pair('Token', 'none on record');
-    pair('Multiple', r.multiple.toFixed(3) + '× TVL from ' + (R.calibration.categories.find(function(c){return c.category===r.category})?.peer_count || R.calibration.global_peers) + ' live peers');
-    pair('Implied value', moneyFull(r.implied_value_usd) + ' [' + money(r.implied_value_ci_low) + ' – ' + money(r.implied_value_ci_high) + ']');
+    pair('Multiple', r.multiple.toFixed(3) + '× TVL from ' + r.peer_count + ' live peers');
+    pair('Implied value', moneyFull(r.implied_value_usd));
     detailBody.appendChild(kv);
 
     detailBody.appendChild(el('div', 'section-title', 'How the number is built'));
@@ -351,10 +344,8 @@
     baseRow.appendChild(baseTrack);
     wf.appendChild(baseRow);
     factor('7d momentum · ' + (r.change_7d === null ? 'n/a' : pct(r.change_7d, 2)), r.growth_7d_mult, r.growth_7d_mult >= 1 ? 'adds' : 'takes', r.growth_7d_mult >= 1 ? 'pos' : 'neg');
-    factor('30d est. · ' + (r.change_30d === null ? 'n/a' : pct(r.change_30d, 2)), r.growth_30d_mult, r.growth_30d_mult >= 1 ? 'adds' : 'takes', r.growth_30d_mult >= 1 ? 'pos' : 'neg');
-    factor('Maturity', r.maturity_mult, 'age ' + (r.age_days === null ? 'unknown' : r.age_days + 'd'), 'pos');
-    factor('Chain quality', r.chain_quality_mult, r.chains.length + ' chains', 'pos');
-    factor('Breadth', r.breadth_mult, r.chains.length > 1 ? (r.chains.length - 1) + ' extra chains' : 'single chain', 'pos');
+    factor('Maturity · ' + (r.age_days === null ? 'age unknown' : r.age_days + 'd old'), r.maturity_mult, null, 'pos');
+    factor('Breadth · ' + r.chains.length + ' chain' + (r.chains.length === 1 ? '' : 's'), r.breadth_mult, null, 'pos');
     var resultRow = el('div', 'wf');
     resultRow.appendChild(el('div', null, 'Implied value'));
     resultRow.appendChild(el('div', 'v', money(r.implied_value_usd)));
@@ -366,10 +357,9 @@
     wf.appendChild(resultRow);
     detailBody.appendChild(wf);
 
-    var box = el('div', 'callout');
+    var box = el('div', 'callout ok');
     box.style.marginTop = '14px';
-    box.textContent = '90% CI: ' + money(r.implied_value_ci_low) + ' – ' + money(r.implied_value_ci_high) + '. ' +
-      'A category with few live peers has its multiple shrunk toward the global median (' + R.calibration.global_median.toFixed(3) + '×).';
+    box.textContent = 'Category multiple is the median mcap/TVL of ' + r.peer_count + ' live peers, shrunk toward global median (0.205×) when peers are few. With zero momentum, value would be ' + money(r.flat_implied_usd) + '.';
     detailBody.appendChild(box);
 
     detailBody.appendChild(el('div', 'section-title', 'Farm plan · ' + farmPlan(r).length + ' steps'));
@@ -404,21 +394,21 @@
   /* ---------- live tokens view ---------- */
 
   var liveStats = document.getElementById('liveStats');
-  liveStats.appendChild(statTile('Live peers measured', String(R.calibration.global_peers), 'protocols with a token on record'));
-  liveStats.appendChild(statTile('Global median multiple', R.calibration.global_median.toFixed(3) + '×', 'market cap over TVL'));
+  liveStats.appendChild(statTile('Live peers measured', String(R.global_peers), 'protocols with a token on record'));
+  liveStats.appendChild(statTile('Global median multiple', R.global_multiple.toFixed(3) + '×', 'market cap over TVL'));
   var liveValue = R.live.reduce(function (a, r) { return a + (r.mcap_usd || 0); }, 0);
   liveStats.appendChild(statTile('Market cap sampled', money(liveValue), R.live.length + ' largest live protocols'));
-  liveStats.appendChild(statTile('Categories measured', String(R.calibration.categories.length), 'each with shrunk multiple'));
+  liveStats.appendChild(statTile('Categories measured', String(R.categories.length), 'each with shrunk multiple'));
 
-  var calMax = R.calibration.categories.length ? Math.max.apply(null, R.calibration.categories.map(function (c) { return c.shrunk_ratio; })) : 1;
+  var calMax = R.categories.length ? Math.max.apply(null, R.categories.map(function (c) { return c.multiple; })) : 1;
   var calBars = document.getElementById('calBars');
-  R.calibration.categories.slice(0, 12).forEach(function (c) {
+  R.categories.slice(0, 12).forEach(function (c) {
     var row = el('div', 'bar-row');
     row.appendChild(el('div', 'name', c.category));
-    row.appendChild(el('div', 'val', c.shrunk_ratio.toFixed(3) + '×'));
+    row.appendChild(el('div', 'val', c.multiple.toFixed(3) + '×'));
     var track = el('div', 'bar-track');
-    var fill = el('div', 'bar-fill' + (c.effective_weight < 0.5 ? ' alt' : ''));
-    fill.style.width = Math.max(2, (c.shrunk_ratio / calMax) * 100).toFixed(1) + '%';
+    var fill = el('div', 'bar-fill' + (c.used_fallback ? ' alt' : ''));
+    fill.style.width = Math.max(2, (c.multiple / calMax) * 100).toFixed(1) + '%';
     track.appendChild(fill);
     row.appendChild(track);
     calBars.appendChild(row);
@@ -436,6 +426,7 @@
     tr.appendChild(el('td', 'num', money(r.tvl_usd)));
     tr.appendChild(el('td', 'num', money(r.mcap_usd)));
     tr.appendChild(el('td', 'num mult', r.ratio.toFixed(2) + '×'));
+    tr.appendChild(el('td', null, r.category || 'Uncategorized'));
     liveRows.appendChild(tr);
   });
   document.getElementById('liveSub').textContent = 'The ' + R.live.length + ' largest live protocols and the mcap/TVL ratio the board calibrates on.';
@@ -444,7 +435,7 @@
 
   var catTable = document.getElementById('catTable');
   var head = el('tr');
-  ['Category', 'Live peers', 'Raw median', 'Shrunk mult.', 'Weight', '90% CI'].forEach(function (h, i) {
+  ['Category', 'Live peers', 'Raw median', 'Shrunk mult.', 'Used', '90% CI'].forEach(function (h, i) {
     var th = el('th', i > 0 ? 'num' : null, h);
     head.appendChild(th);
   });
@@ -452,13 +443,13 @@
   thead.appendChild(head);
   catTable.appendChild(thead);
   var tbody2 = el('tbody');
-  R.calibration.categories.forEach(function (c) {
+  R.categories.forEach(function (c) {
     var tr = el('tr');
     tr.appendChild(el('td', null, c.category));
-    tr.appendChild(el('td', 'num', c.peer_count));
+    tr.appendChild(el('td', 'num', c.peers));
     tr.appendChild(el('td', 'num', c.median_ratio.toFixed(3) + '×'));
-    tr.appendChild(el('td', 'num', c.shrunk_ratio.toFixed(3) + '×'));
-    tr.appendChild(el('td', 'num', (c.effective_weight * 100).toFixed(0) + '%'));
+    tr.appendChild(el('td', 'num', c.multiple.toFixed(3) + '×'));
+    tr.appendChild(el('td', 'num', c.used_fallback ? 'global fallback' : 'category median'));
     tr.appendChild(el('td', 'num', c.ci_low.toFixed(3) + ' – ' + c.ci_high.toFixed(3) + '×'));
     tbody2.appendChild(tr);
   });
@@ -474,18 +465,15 @@
   var M = R.model;
   [
     ['calibration', M.calibration, 'where the multiple comes from'],
-    ['shrinkage_prior_count', M.shrinkage_prior_count, 'virtual peers pulling thin categories toward global median'],
-    ['min_peers_for_category', M.min_peers_for_category, 'peers a category needs before its own median is used'],
-    ['growth_weight_7d', M.growth_weight_7d, 'how hard a week of TVL growth counts'],
-    ['growth_weight_30d', M.growth_weight_30d, 'how hard estimated 30d growth counts'],
-    ['growth_floor / cap', M.growth_floor + ' / ' + M.growth_cap, 'range the change is clamped to'],
-    ['maturity_half_life_days', M.maturity_half_life_days, 'age at which maturity reaches halfway to 1.0'],
-    ['maturity_floor', M.maturity_floor, 'minimum maturity for brand-new protocols'],
-    ['chain_quality', JSON.stringify(M.chain_quality), 'per-chain quality weights'],
-    ['default_chain_quality', M.default_chain_quality, 'fallback for unnamed chains'],
-    ['breadth_step / cap', M.breadth_step + ' / ' + M.breadth_cap, 'extra chain bonus and max'],
-    ['implied_floor', M.implied_floor, 'minimum implied value'],
-    ['uncertainty_scaling', M.uncertainty_scaling, 'CI width scaling factor'],
+    ['calibration_min_peers', M.calibration_min_peers, 'peers a category needs before its own median is used'],
+    ['calibration_shrinkage', M.calibration_shrinkage, 'virtual peers pulling a thin category toward the global median'],
+    ['growth_weight', M.growth_weight, 'how hard a week of TVL growth counts'],
+    ['growth_floor / cap', M.growth_floor + ' / ' + M.growth_cap, 'the range the seven-day change is clamped to'],
+    ['maturity_floor / range', M.maturity_floor + ' / ' + M.maturity_range, 'how much a protocol\'s age is worth'],
+    ['maturity_days', M.maturity_days, 'the age at which maturity stops rising'],
+    ['unknown_age_days', M.unknown_age_days, 'the age assumed when the snapshot has none'],
+    ['breadth_step / cap', M.breadth_step + ' / ' + M.breadth_cap, 'what an extra chain is worth, and how many count'],
+    ['default_multiple', M.default_multiple, 'the multiple used when no live peer exists at all'],
   ].forEach(function (row) {
     var tr = el('tr');
     tr.appendChild(el('td', 'mono', row[0]));
