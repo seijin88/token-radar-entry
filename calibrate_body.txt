@@ -1,0 +1,85 @@
+{
+  const live = snapshot.protocols.filter(p => liveRatio(p) !== null);
+  const allRatios: number[] = [];
+  const perCategory = new Map<string, { ratios: number[]; features: FeatureVector[] }>();
+
+  // Extract categories
+  const categories = [...new Set(live.map(p => p.category ?? 'Uncategorized'))].sort();
+
+  for (const p of live) {
+    const ratio = liveRatio(p)!;
+    allRatios.push(ratio);
+    const key = p.category ?? 'Uncategorized';
+    const entry = perCategory.get(key);
+    if (entry === undefined) perCategory.set(key, { ratios: [ratio], features: [extractFeatures(p, snapshot, [...perCategory.keys()].sort())] });
+    else { entry.ratios.push(ratio); entry.features.push(extractFeatures(p, snapshot, [...perCategory.keys()].sort())); }
+  }
+
+  const globalMedian = median(allRatios) ?? model.default_multiple;
+  const globalPeers = allRatios.length;
+
+  const catModels: any[] = [];
+  const sortedCats = [...perCategory.keys()].sort();
+
+  for (const [category, data] of perCategory) {
+    const n = data.ratios.length;
+    const winsorized = winsorize(data.ratios, 0.05);
+    const catMedian = median(winsorized);
+    const use = n >= model.calibration_min_peers && catMedian !== null;
+    const multiple = use ? catMedian! : globalMedian;
+    const shrunk = use
+      ? (n * catMedian! + model.calibration_shrinkage * globalMedian) / (n + model.calibration_shrinkage)
+      : globalMedian;
+    const ci_low = Math.max(0, catMedian! - 1.96 * medianSE(winsorized));
+    const ci_high = catMedian! + 1.96 * medianSE(winsorized);
+
+    let model: RidgeModel | null = null;
+    let validation = { mae: 0, coverage: 1, interval_width: 0, r2: 0 };
+
+    if (use && n >= 5) {
+      // Build feature matrix
+      const X = data.features.map(f => [f.log_tvl, f.age_days, f.chain_count, f.change_7d, f.category_idx]);
+      const y = data.ratios.map(r => Math.log(Math.max(0.001, r)));
+      try {
+        model = fitNestedCV(X, y, MODEL);
+        // Evaluate on full data
+        const XAll = X.map(row => [1, ...row]);
+        const preds = predict(XAll, model.weights);
+        const actualLog = y;
+        const predVals = preds.map(p => Math.exp(p));
+        const actualVals = actualLog.map(v => Math.exp(v));
+        const maeVal = mae(actualVals, predVals);
+        const r2Val = r2(actualLog, preds);
+        // Conformal interval
+        const residuals = actualLog.map((v, i) => Math.abs(v - preds[i]));
+        const q = residuals.sort((a, b) => a - b)[Math.floor(0.9 * residuals.length)];
+        const coverage = actualLog.filter((v, i) => Math.abs(v - preds[i]) <= q).length / actualLog.length;
+        const intervalWidth = 2 * q;
+
+        validation = {
+          mae: maeVal,
+          coverage,
+          interval_width: intervalWidth,
+          r2: r2Val,
+        };
+      } catch (e) {
+        // Fallback
+        model = null;
+      }
+    }
+
+    catModels.push({
+      category,
+      median_ratio: catMedian ?? globalMedian,
+      shrunk_ratio: shrunk,
+      peer_count: n,
+      used_fallback: !use,
+      ci_low: Math.max(0, catMedian! - 1.96 * medianSE(winsorized)),
+      ci_high: catMedian! + 1.96 * medianSE(winsorized),
+      model,
+      validation,
+    });
+  }
+
+  return { global: globalMedian, globalPeers, categories: catModels };
+}

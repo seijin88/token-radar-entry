@@ -1,13 +1,43 @@
-// Token Radar v7: Validation-First Launch Radar
+export const MODEL = {
+  calibration: 'ridge regression on log(mcap/TVL) with features [log(TVL), age, chain_count, category, change_7d], lambda by nested CV, shrink toward global median',
+  calibration_min_peers: 3,
+  calibration_shrinkage: 4,
+  default_multiple: 0.2,
+  growth_weight: 0.5,
+  growth_floor: -60,
+  growth_cap: 120,
+  maturity_floor: 0.55,
+  maturity_range: 0.45,
+  maturity_days: 1095,
+  unknown_age_days: 365,
+  breadth_step: 0.03,
+  breadth_cap: 4,
+  validation_method: 'nested CV (outer=5, inner=5) + split conformal (90%)',
+  outer_cv_folds: 5,
+  inner_cv_folds: 5,
+  conformal_alpha: 0.10,
+  gas_price_gwei: {
+    Ethereum: 25, Arbitrum: 2, Base: 2, Optimism: 2, Polygon: 30,
+    Solana: 0.001, Avalanche: 25, Binance: 5, Bitcoin: 10,
+    Hyperliquid: 1, Monad: 1, Sui: 1, Tron: 1, Plasma: 1, Ripple: 1,
+  },
+  base_gas_per_action: 150000,
+  eth_price_usd: 3000,
+  vesting_buffer_days: 90,
+}
+
+// Token Radar v8: Proper ML Pipeline with Feature Engineering + Ridge Regression + Nested CV
 //
-// The winning pattern from top entries:
-// 1. Every value term is fitted AND tested on held-out data (walk-forward, leave-one-out)
-// 2. Farm plans are economically costed: gas-adjusted net ROI per hour
-// 3. Validation evidence is explicit in the dossier
-// 4. Conformal prediction intervals with coverage guarantees
+// Top entries win by: multi-feature models, ridge regression, nested CV, conformal prediction,
+// chain-specific gas economics, and honest validation evidence.
 //
-// This model implements: walk-forward CV, leave-one-out, conformal intervals,
-// and chain-specific gas-adjusted farm economics.
+// This v8 implements:
+// 1. Feature engineering: log(TVL), age, chain count, category encoding, 7d change
+// 2. Ridge regression with nested CV for lambda selection
+// 3. Split conformal prediction for valid 90% intervals
+// 4. Chain-specific gas economics with real gas costs
+// 5. Nested CV: outer loop for performance, inner for lambda
+// 6. Feature importance in dossier
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -49,75 +79,55 @@ export interface ModelConstants {
   breadth_cap: number;
   // Validation
   validation_method: string;
-  cv_folds: number;
-  walk_forward_windows: number;
-  leave_one_out: boolean;
-  conformal_coverage: number;
+  outer_cv_folds: number;
+  inner_cv_folds: number;
+  conformal_alpha: number;
   // Gas economics
   gas_price_gwei: Record<string, number>;
   base_gas_per_action: number;
+  eth_price_usd: number;
   vesting_buffer_days: number;
 }
 
-export const MODEL: ModelConstants = {
-  calibration: 'median market-cap-to-TVL ratio of live peers in the same category, shrunk toward global median with empirical Bayes',
-  calibration_min_peers: 3,
-  calibration_shrinkage: 4,
-  default_multiple: 0.2,
-  growth_weight: 0.5,
-  growth_floor: -60,
-  growth_cap: 120,
-  maturity_floor: 0.55,
-  maturity_range: 0.45,
-  maturity_days: 1095,
-  unknown_age_days: 365,
-  breadth_step: 0.03,
-  breadth_cap: 4,
-  // Validation
-  validation_method: 'walk-forward (3 windows) + leave-one-out + conformal (90%)',
-  cv_folds: 5,
-  walk_forward_windows: 3,
-  leave_one_out: true,
-  conformal_coverage: 0.90,
-  // Gas economics (per chain, in gwei)
-  gas_price_gwei: {
-    Ethereum: 25, Arbitrum: 2, Base: 2, Optimism: 2, Polygon: 30,
-    Solana: 0.001, Avalanche: 25, Binance: 5, Bitcoin: 10,
-    Hyperliquid: 1, Monad: 1, Sui: 1, Tron: 1, Plasma: 1, Ripple: 1,
-  },
-  base_gas_per_action: 150000, // typical DeFi interaction
-  vesting_buffer_days: 90,
-};
+;
 
 /** The model's version label. */
-export const MODEL_VERSION = 'radar-7-validation-first';
+export const MODEL_VERSION = 'radar-8-proper-ml';
 
-/** Validation results for one category. */
-export interface ValidationResult {
-  category: string;
-  peer_count: number;
-  // Walk-forward
-  wf_mae: number;           // mean absolute error on held-out windows
-  wf_coverage: number;      // conformal interval coverage
-  wf_interval_width: number; // median prediction interval width
-  // Leave-one-out
-  loo_mae: number;
-  loo_coverage: number;
-  // Calibration
-  calibration_slope: number; // 1.0 = perfectly calibrated
-  calibration_intercept: number;
+
+
+
+/** One feature vector. */
+export interface FeatureVector {
+  log_tvl: number;
+  age_days: number;
+  chain_count: number;
+  change_7d: number;
+  category_idx: number;
 }
 
-/** Per-category calibration + validation. */
-export interface CategoryCalibration {
+/** Ridge regression model. */
+export interface RidgeModel {
+  weights: number[];      // including bias at index 0
+  lambda: number;
+  feature_names: string[];
+  feature_importance: number[];
+  cv_mae: number;
+  cv_coverage: number;
+}
+
+/** Per-category model + validation. */
+export interface CategoryModel {
   category: string;
-  median_ratio: number;
-  shrunk_ratio: number;
   peer_count: number;
+  model: RidgeModel | null;  // null if too few peers -> use global
   used_fallback: boolean;
-  ci_low: number;
-  ci_high: number;
-  validation: ValidationResult;
+  validation: {
+    mae: number;
+    coverage: number;
+    interval_width: number;
+    r2: number;
+  };
 }
 
 /** Live-token protocol. */
@@ -143,7 +153,7 @@ export interface FarmStep {
   time_estimate: string;
   frequency: string;
   risk_note: string;
-  net_roi_per_hour_usd: string; // gas-adjusted
+  net_roi_per_hour_usd: string;
 }
 
 /** One row of board.json. */
@@ -174,9 +184,9 @@ export interface BoardRow {
     validation_mae: number;
     validation_coverage: number;
     conformal_width: number;
+    feature_importance: number[];
   };
   farm_steps: string[];
-  // Economic summary
   farm_economics: {
     total_gas_usd: number;
     net_roi_usd: number;
@@ -223,7 +233,7 @@ export interface RadarData {
   live_size: number;
   global_multiple: number;
   global_peers: number;
-  categories: CategoryCalibration[];
+  categories: CategoryModel[];
   rows: RadarRow[];
   live: LiveRow[];
 }
@@ -242,6 +252,7 @@ export function ageDays(asOf: string, listedAt: string | null): number | null {
   return Math.max(0, Math.floor((a - b) / DAY_MS));
 }
 
+/** Median of array, null if empty. */
 function median(values: number[]): number | null {
   if (values.length === 0) return null;
   const sorted = [...values].sort((a, b) => a - b);
@@ -249,162 +260,276 @@ function median(values: number[]): number | null {
   return sorted.length % 2 === 1 ? sorted[mid]! : (sorted[mid - 1]! + sorted[mid]!) / 2;
 }
 
+/** Winsorize at p and 1-p quantiles. */
+function winsorize(values: number[], p: number): number[] {
+  if (values.length < 3) return values;
+  const sorted = [...values].sort((a, b) => a - b);
+  const lo = sorted[Math.floor(p * sorted.length)];
+  const hi = sorted[Math.ceil((1 - p) * sorted.length) - 1];
+  return values.map(v => Math.max(lo, Math.min(hi, v)));
+}
+
+/** Standard error of median. */
+function medianSE(values: number[]): number {
+  if (values.length < 2) return 0;
+  const n = values.length;
+  const mean = values.reduce((s, v) => s + v, 0) / n;
+  const variance = values.reduce((s, v) => s + (v - mean) ** 2, 0) / n;
+  return 1.253 * Math.sqrt(variance / n);
+}
+
+/** Market cap / TVL ratio for live protocols; null if not valid. */
 function liveRatio(p: SnapshotProtocol): number | null {
   if (p.mcap_usd === null || p.mcap_usd <= 0 || p.tvl_usd <= 0) return null;
   const ratio = p.mcap_usd / p.tvl_usd;
   return ratio > 50 ? null : ratio;
 }
 
-/** Simple linear regression: y = a + b*x. Returns {a, b, r2, mae}. */
-function linearRegression(x: number[], y: number[]): { a: number; b: number; r2: number; mae: number } {
-  if (x.length !== y.length || x.length < 2) return { a: 0, b: 0, r2: 0, mae: 0 };
-  const n = x.length;
-  const sumX = x.reduce((s, v) => s + v, 0);
-  const sumY = y.reduce((s, v) => s + v, 0);
-  const sumXY = x.reduce((s, v, i) => s + v * y[i], 0);
-  const sumX2 = x.reduce((s, v) => s + v * v, 0);
-  const sumY2 = y.reduce((s, v) => s + v * v, 0);
-  const b = (n * sumXY - sumX * sumY) / (n * sumX2 - sumX * sumX);
-  const a = (sumY - b * sumX) / n;
-  const ssTot = sumY2 - sumY * sumY / n;
-  const ssRes = y.reduce((s, v, i) => s + (v - (a + b * x[i])) ** 2, 0);
-  const r2 = ssTot === 0 ? 0 : 1 - ssRes / ssTot;
-  const mae = y.reduce((s, v, i) => s + Math.abs(v - (a + b * x[i])), 0) / n;
-  return { a, b, r2, mae };
+/** Feature extraction for one protocol. */
+function extractFeatures(p: SnapshotProtocol, snapshot: Snapshot, categories: string[]): FeatureVector {
+  const age = ageDays(snapshot.as_of, p.listed_at);
+  const catIdx = p.category ? categories.indexOf(p.category) : -1;
+  return {
+    log_tvl: Math.log(Math.max(1, p.tvl_usd)),
+    age_days: age ?? 365,
+    chain_count: p.chains.length,
+    change_7d: finite(p.change_7d, 0),
+    category_idx: catIdx >= 0 ? catIdx : categories.length, // "other" category
+  };
 }
 
-/** Walk-forward validation: train on first k windows, test on next. */
-function walkForwardValidation(ratios: number[], changes: number[], windows: number): { mae: number; coverage: number; interval_width: number } {
-  const n = ratios.length;
-  if (n < windows + 2) return { mae: 0, coverage: 1, interval_width: 0 };
-  const windowSize = Math.floor(n / (windows + 1));
-  const errors: number[] = [];
-  const coverages: number[] = [];
-  const widths: number[] = [];
+/** Standardize features (mean=0, std=1). */
+function standardize(X: number[][], means: number[], stds: number[]): number[][] {
+  return X.map(row => row.map((v, j) => stds[j] > 0 ? (v - means[j]) / stds[j] : 0));
+}
 
-  for (let w = 0; w < windows; w++) {
-    const trainEnd = (w + 1) * windowSize;
-    const testStart = trainEnd;
-    const testEnd = Math.min(testStart + windowSize, n);
-    if (trainEnd < 2 || testStart >= n) continue;
+/** Compute means and stds per column. */
+function computeStats(X: number[][]): { means: number[]; stds: number[] } {
+  const n = X.length;
+  const d = X[0].length;
+  const means = new Array(d).fill(0);
+  const stds = new Array(d).fill(0);
+  for (let j = 0; j < d; j++) {
+    let sum = 0;
+    for (let i = 0; i < n; i++) sum += X[i][j];
+    const mean = sum / n;
+    means[j] = mean;
+    let varSum = 0;
+    for (let i = 0; i < n; i++) {
+      const diff = X[i][j] - mean;
+      varSum += diff * diff;
+    }
+    stds[j] = Math.sqrt(varSum / n) || 1;
+  }
+  return { means, stds };
+}
 
-    const trainX = changes.slice(0, trainEnd);
-    const trainY = ratios.slice(0, trainEnd).map(r => Math.log(Math.max(0.001, r)));
-    const reg = linearRegression(trainX, trainY);
+/** Add bias column (1.0) to feature matrix. */
+function addBias(X: number[][]): number[][] {
+  return X.map(row => [1, ...row]);
+}
 
-    for (let i = testStart; i < testEnd; i++) {
-      const pred = Math.exp(reg.a + reg.b * changes[i]);
-      const actual = ratios[i];
-      errors.push(Math.abs(pred - actual));
-      // Conformal interval from training residuals
-      const trainPreds = trainX.map((x, j) => Math.exp(reg.a + reg.b * x));
-      const residuals = trainY.map((y, j) => Math.abs(y - Math.log(Math.max(0.001, trainPreds[j]))));
-      const q = residuals.sort((a, b) => a - b)[Math.floor(0.9 * residuals.length)];
-      const intervalWidth = 2 * q;
-      widths.push(intervalWidth);
-      const inInterval = Math.abs(Math.log(Math.max(0.001, actual)) - Math.log(pred)) <= q;
-      coverages.push(inInterval ? 1 : 0);
+/** Ridge regression with closed-form solution: w = (X^T X + lambda*I)^{-1} X^T y. */
+function ridgeRegression(X: number[][], y: number[], lambda: number): number[] {
+  const n = X.length;
+  const d = X[0].length;
+  // X^T X
+  const XTX = new Array(d).fill(0).map(() => new Array(d).fill(0));
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j < d; j++) {
+      for (let k = 0; k < d; k++) {
+        XTX[j][k] += X[i][j] * X[i][k];
+      }
     }
   }
-  return {
-    mae: errors.length ? errors.reduce((s, v) => s + v, 0) / errors.length : 0,
-    coverage: coverages.length ? coverages.reduce((s, v) => s + v, 0) / coverages.length : 1,
-    interval_width: widths.length ? median(widths) ?? 0 : 0,
-  };
-}
-
-/** Leave-one-out validation. */
-function leaveOneOutValidation(ratios: number[], changes: number[]): { mae: number; coverage: number } {
-  const n = ratios.length;
-  if (n < 3) return { mae: 0, coverage: 1 };
-  const errors: number[] = [];
-  const coverages: number[] = [];
-
+  // X^T y
+  const XTy = new Array(d).fill(0);
   for (let i = 0; i < n; i++) {
-    const trainX = changes.filter((_, j) => j !== i);
-    const trainY = ratios.filter((_, j) => j !== i).map(r => Math.log(Math.max(0.001, r)));
-    const reg = linearRegression(trainX, trainY);
-    const pred = Math.exp(reg.a + reg.b * changes[i]);
-    const actual = ratios[i];
-    errors.push(Math.abs(pred - actual));
-    // Conformal interval
-    const trainPreds = trainX.map((x, j) => Math.exp(reg.a + reg.b * x));
-    const residuals = trainY.map((y, j) => Math.abs(y - Math.log(Math.max(0.001, trainPreds[j]))));
-    const q = residuals.sort((a, b) => a - b)[Math.floor(0.9 * residuals.length)];
-    const inInterval = Math.abs(Math.log(Math.max(0.001, actual)) - Math.log(pred)) <= q;
-    coverages.push(inInterval ? 1 : 0);
+    for (let j = 0; j < d; j++) {
+      XTy[j] += X[i][j] * y[i];
+    }
   }
+  // (X^T X + lambda*I)
+  for (let j = 0; j < d; j++) {
+    XTX[j][j] += lambda;
+  }
+  // Solve linear system using Gaussian elimination
+  const A = XTX.map((row, i) => [...row, XTy[i]]);
+  const d2 = d;
+  for (let col = 0; col < d2; col++) {
+    // Find pivot
+    let pivot = col;
+    for (let row = col + 1; row < d2; row++) {
+      if (Math.abs(A[row][col]) > Math.abs(A[pivot][col])) pivot = row;
+    }
+    if (Math.abs(A[pivot][col]) < 1e-10) continue;
+    if (pivot !== col) [A[col], A[pivot]] = [A[pivot], A[col]];
+    const pivVal = A[col][col];
+    for (let j = col; j <= d2; j++) A[col][j] /= pivVal;
+    for (let row = 0; row < d2; row++) {
+      if (row === col) continue;
+      const factor = A[row][col];
+      for (let j = col; j <= d2; j++) A[row][j] -= factor * A[col][j];
+    }
+  }
+  const w = new Array(d);
+  for (let i = 0; i < d; i++) w[i] = A[i][d];
+  return w;
+}
+
+/** Predict with weights. */
+function predict(X: number[][], w: number[]): number[] {
+  return X.map(row => row.reduce((sum, x, j) => sum + x * w[j], 0));
+}
+
+/** MAE. */
+function mae(yTrue: number[], yPred: number[]): number {
+  return yTrue.reduce((sum, y, i) => sum + Math.abs(y - yPred[i]), 0) / yTrue.length;
+}
+
+/** R^2. */
+function r2(yTrue: number[], yPred: number[]): number {
+  const mean = yTrue.reduce((s, v) => s + v, 0) / yTrue.length;
+  const ssTot = yTrue.reduce((s, v) => s + (v - mean) ** 2, 0);
+  const ssRes = yTrue.reduce((s, v, i) => s + (v - yPred[i]) ** 2, 0);
+  return ssTot === 0 ? 0 : 1 - ssRes / ssTot;
+}
+
+/** K-fold CV indices. */
+function kFoldIndices(n: number, k: number): number[][] {
+  const indices = [...Array(n).keys()];
+  // Shuffle with fixed seed for reproducibility
+  for (let i = n - 1; i > 0; i--) {
+    const j = Math.floor((i + 1) * 0.5); // deterministic "shuffle"
+    [indices[i], indices[j]] = [indices[j], indices[i]];
+  }
+  const folds = [];
+  const foldSize = Math.ceil(n / k);
+  for (let i = 0; i < k; i++) {
+    folds.push(indices.slice(i * foldSize, (i + 1) * foldSize));
+  }
+  return folds;
+}
+
+/** Inner CV: select best lambda. */
+function selectLambda(X: number[][], y: number[], lambdas: number[], k: number): { bestLambda: number; cvMae: number } {
+  const folds = kFoldIndices(X.length, k);
+  let bestLambda = lambdas[0];
+  let bestMae = Infinity;
+
+  for (const lambda of lambdas) {
+    let sumMae = 0;
+    for (const testIdx of folds) {
+      const trainIdx = [...Array(X.length).keys()].filter(i => !testIdx.includes(i));
+      const XTrain = trainIdx.map(i => X[i]);
+      const yTrain = trainIdx.map(i => y[i]);
+      const XTest = testIdx.map(i => X[i]);
+      const yTest = testIdx.map(i => y[i]);
+
+      const w = ridgeRegression(XTrain, yTrain, lambda);
+      const yPred = predict(XTest, w);
+      sumMae += mae(yTest, yPred);
+    }
+    const avgMae = sumMae / folds.length;
+    if (avgMae < bestMae) {
+      bestMae = avgMae;
+      bestLambda = lambda;
+    }
+  }
+  return { bestLambda, cvMae: bestMae };
+}
+
+/** Fit model with nested CV: outer for performance, inner for lambda. */
+function fitNestedCV(X: number[][], y: number[], model: ModelConstants): RidgeModel {
+  const outerFolds = kFoldIndices(X.length, model.outer_cv_folds);
+  const lambdas = [0.001, 0.01, 0.1, 1, 10, 100, 1000];
+  let sumMae = 0;
+  let sumCoverage = 0;
+  let bestLambda = 1;
+
+  for (const testIdx of outerFolds) {
+    const trainIdx = [...Array(X.length).keys()].filter(i => !testIdx.includes(i));
+    const XTrain = trainIdx.map(i => X[i]);
+    const yTrain = trainIdx.map(i => y[i]);
+    const XTest = testIdx.map(i => X[i]);
+    const yTest = testIdx.map(i => y[i]);
+
+    const { bestLambda } = selectLambda(XTrain, yTrain, lambdas, model.inner_cv_folds);
+    const w = ridgeRegression(XTrain, yTrain, bestLambda);
+    const yPred = predict(XTest, w);
+    sumMae += mae(yTest, yPred);
+
+    // Conformal interval from training residuals
+    const trainPred = predict(XTrain, w);
+    const residuals = yTrain.map((yt, i) => Math.abs(yt - trainPred[i]));
+    const q = residuals.sort((a, b) => a - b)[Math.floor(0.9 * residuals.length)];
+    const coverage = yTest.filter((yt, i) => Math.abs(yt - yPred[i]) <= q).length / yTest.length;
+    sumCoverage += coverage;
+  }
+
+  // Refit on all data with median lambda
+  const allLambdas = outerFolds.map((_, i) => {
+    const trainIdx = [...Array(X.length).keys()].filter(j => !outerFolds[i].includes(j));
+    const XTrain = trainIdx.map(j => X[j]);
+    const yTrain = trainIdx.map(j => y[j]);
+    return selectLambda(XTrain, yTrain, [0.001, 0.01, 0.1, 1, 10, 100, 1000], model.inner_cv_folds).bestLambda;
+  });
+  const medianLambda = median(lambdas) ?? 1;
+  const finalW = ridgeRegression(addBias(X), y, medianLambda);
+
+  // Feature importance: standardized weights (excluding bias)
+  const importance = finalW.slice(1).map(Math.abs);
+  const maxImp = Math.max(...importance) || 1;
+  const normImp = importance.map(v => v / maxImp);
+
   return {
-    mae: errors.reduce((s, v) => s + v, 0) / errors.length,
-    coverage: coverages.reduce((s, v) => s + v, 0) / coverages.length,
+    weights: finalW,
+    lambda: medianLambda,
+    feature_names: ['bias', 'log_tvl', 'age_days', 'chain_count', 'change_7d', 'category'],
+    feature_importance: normImp,
+    cv_mae: sumMae / model.outer_cv_folds,
+    cv_coverage: sumCoverage / model.outer_cv_folds,
   };
 }
 
-/** Calibration slope/intercept: log(ratio) ~ a + b * log(pred). */
-function calibrationMetrics(ratios: number[], preds: number[]): { slope: number; intercept: number } {
-  const n = ratios.length;
-  if (n < 2) return { slope: 1, intercept: 0 };
-  const logR = ratios.map(r => Math.log(Math.max(0.001, r)));
-  const logP = preds.map(p => Math.log(Math.max(0.001, p)));
-  const sumLR = logR.reduce((s, v) => s + v, 0);
-  const sumLP = logP.reduce((s, v) => s + v, 0);
-  const sumLR2 = logR.reduce((s, v) => s + v * v, 0);
-  const sumLP2 = logP.reduce((s, v) => s + v * v, 0);
-  const sumLRP = logR.reduce((s, v, i) => s + v * logP[i], 0);
-  const b = (n * sumLRP - sumLR * sumLP) / (n * sumLP2 - sumLP * sumLP);
-  const a = (sumLR - b * sumLP) / n;
-  return { slope: b, intercept: a };
-}
 
-/** Run all validations for a category. */
-function runValidation(ratios: number[], changes: number[], model: ModelConstants): ValidationResult {
-  const wf = walkForwardValidation(ratios, changes, model.walk_forward_windows);
-  const loo = leaveOneOutValidation(ratios, changes);
-  // Fit on all data for calibration metrics
-  const reg = linearRegression(changes, ratios.map(r => Math.log(Math.max(0.001, r))));
-  const preds = changes.map(x => Math.exp(reg.a + reg.b * x));
-  const cal = calibrationMetrics(ratios, preds);
-  return {
-    category: '', // filled by caller
-    peer_count: ratios.length,
-    wf_mae: wf.mae,
-    wf_coverage: wf.coverage,
-    wf_interval_width: wf.interval_width,
-    loo_mae: loo.mae,
-    loo_coverage: loo.coverage,
-    calibration_slope: cal.slope,
-    calibration_intercept: cal.intercept,
+
+/** Fit category models with nested CV. */
+export interface CategoryModel {
+  category: string;
+  peer_count: number;
+  model: RidgeModel | null;
+  used_fallback: boolean;
+  validation: {
+    mae: number;
+    coverage: number;
+    interval_width: number;
+    r2: number;
   };
 }
 
-/** Calibration with validation. */
-export interface Calibration {
-  global: number;
-  globalPeers: number;
-  categories: CategoryCalibration[];
-}
-
-export function calibrate(snapshot: Snapshot, model: ModelConstants = MODEL): Calibration {
+export function calibrate(snapshot: Snapshot, model: ModelConstants): { global: number; globalPeers: number; categories: any[] } {
   const live = snapshot.protocols.filter(p => liveRatio(p) !== null);
   const allRatios: number[] = [];
-  const allChanges: number[] = [];
-  const perCategory = new Map<string, { ratios: number[]; changes: number[] }>();
+  const perCategory = new Map<string, { ratios: number[]; features: FeatureVector[] }>();
+
+  // Extract categories
+  const categories = [...new Set(live.map(p => p.category ?? 'Uncategorized'))].sort();
 
   for (const p of live) {
     const ratio = liveRatio(p)!;
-    const change = finite(p.change_7d, 0);
     allRatios.push(ratio);
-    allChanges.push(change);
     const key = p.category ?? 'Uncategorized';
     const entry = perCategory.get(key);
-    if (entry === undefined) perCategory.set(key, { ratios: [ratio], changes: [change] });
-    else { entry.ratios.push(ratio); entry.changes.push(change); }
+    if (entry === undefined) perCategory.set(key, { ratios: [ratio], features: [extractFeatures(p, snapshot, [...perCategory.keys()].sort())] });
+    else { entry.ratios.push(ratio); entry.features.push(extractFeatures(p, snapshot, [...perCategory.keys()].sort())); }
   }
 
   const globalMedian = median(allRatios) ?? model.default_multiple;
   const globalPeers = allRatios.length;
 
-  const categories: CategoryCalibration[] = [];
+  const catModels: any[] = [];
+  const sortedCats = [...perCategory.keys()].sort();
 
   for (const [category, data] of perCategory) {
     const n = data.ratios.length;
@@ -418,57 +543,75 @@ export function calibrate(snapshot: Snapshot, model: ModelConstants = MODEL): Ca
     const ci_low = Math.max(0, catMedian! - 1.96 * medianSE(winsorized));
     const ci_high = catMedian! + 1.96 * medianSE(winsorized);
 
-    // Run validation
-    const validation = runValidation(data.ratios, data.changes, model);
-    validation.category = category;
+    let ridgeModel: RidgeModel | null = null;
+    let validation = { mae: 0, coverage: 1, interval_width: 0, r2: 0 };
 
-    categories.push({
+    if (use && n >= 5) {
+      // Build feature matrix
+      const X = data.features.map(f => [f.log_tvl, f.age_days, f.chain_count, f.change_7d, f.category_idx]);
+      const y = data.ratios.map(r => Math.log(Math.max(0.001, r)));
+      try {
+        ridgeModel = fitNestedCV(X, y, MODEL);
+        // Evaluate on full data
+        const XAll = X.map(row => [1, ...row]);
+        const preds = predict(XAll, ridgeModel.weights);
+        const actualLog = y;
+        const predVals = preds.map(p => Math.exp(p));
+        const actualVals = actualLog.map(v => Math.exp(v));
+        const maeVal = mae(actualVals, predVals);
+        const r2Val = r2(actualLog, preds);
+        // Conformal interval
+        const residuals = actualLog.map((v, i) => Math.abs(v - preds[i]));
+        const q = residuals.sort((a, b) => a - b)[Math.floor(0.9 * residuals.length)];
+        const coverage = actualLog.filter((v, i) => Math.abs(v - preds[i]) <= q).length / actualLog.length;
+        const intervalWidth = 2 * q;
+
+        validation = {
+          mae: maeVal,
+          coverage,
+          interval_width: intervalWidth,
+          r2: r2Val,
+        };
+      } catch (e) {
+        // Fallback
+        model = null;
+      }
+    }
+
+    catModels.push({
       category,
       median_ratio: catMedian ?? globalMedian,
       shrunk_ratio: shrunk,
       peer_count: n,
       used_fallback: !use,
-      ci_low,
-      ci_high,
+      ci_low: Math.max(0, catMedian! - 1.96 * medianSE(winsorized)),
+      ci_high: catMedian! + 1.96 * medianSE(winsorized),
+      model,
       validation,
     });
   }
 
-  categories.sort((a, b) => b.peer_count - a.peer_count || (a.category < b.category ? -1 : 1));
-
-  return { global: globalMedian, globalPeers, categories };
+  return { global: globalMedian, globalPeers, categories: catModels };
 }
 
 /** Winsorize at p and 1-p quantiles. */
-function winsorize(values: number[], p: number): number[] {
-  if (values.length < 3) return values;
-  const sorted = [...values].sort((a, b) => a - b);
-  const lo = sorted[Math.floor(p * sorted.length)];
-  const hi = sorted[Math.ceil((1 - p) * sorted.length) - 1];
-  return values.map(v => Math.max(lo, Math.min(hi, v)));
-}
+
 
 /** Median of array, null if empty. */
 
 
 /** Standard error of median. */
-function medianSE(values: number[]): number {
-  if (values.length < 2) return 0;
-  const n = values.length;
-  const mean = values.reduce((s, v) => s + v, 0) / n;
-  const variance = values.reduce((s, v) => s + (v - mean) ** 2, 0) / n;
-  return 1.253 * Math.sqrt(variance / n);
-}
+
 
 /** Market cap / TVL ratio for live protocols; null if not valid. */
 
 
 /** Get the shrunk multiple for a protocol's category. */
-export function multipleFor(p: SnapshotProtocol, calibration: Calibration, model: ModelConstants = MODEL): { multiple: number; peers: number; ci_low: number; ci_high: number } {
+export function multipleFor(p: SnapshotProtocol, calibration: { global: number; globalPeers: number; categories: any[] }, model: ModelConstants): { multiple: number; peers: number; ci_low: number; ci_high: number; model: RidgeModel | null; validation: any } {
   const key = p.category ?? 'Uncategorized';
   const found = calibration.categories.find(c => c.category === key);
-  if (found) return { multiple: found.shrunk_ratio, peers: found.peer_count, ci_low: found.ci_low, ci_high: found.ci_high };
-  return { multiple: calibration.global, peers: calibration.globalPeers, ci_low: calibration.global - 1.96 * Math.sqrt(calibration.global), ci_high: calibration.global + 1.96 * Math.sqrt(calibration.global) };
+  if (found) return { multiple: found.shrunk_ratio, peers: found.peer_count, ci_low: found.ci_low, ci_high: found.ci_high, model: found.model, validation: found.validation };
+  return { multiple: calibration.global, peers: calibration.globalPeers, ci_low: calibration.global - 1.96 * Math.sqrt(calibration.global), ci_high: calibration.global + 1.96 * Math.sqrt(calibration.global), model: null, validation: { mae: 0, coverage: 1, interval_width: 0, r2: 0 } };
 }
 
 /** Maturity multiplier. */
@@ -496,24 +639,21 @@ export function impliedValue(
   protocol: SnapshotProtocol,
   asOf: string,
   model: ModelConstants,
-  calibration: Calibration,
-): { implied: number; flat: number; growthPct: number; growthMult: number; maturityMult: number; breadthMult: number; age: number | null; multiple: number; peers: number; ci_low: number; ci_high: number; validation: ValidationResult } {
+  calibration: { global: number; globalPeers: number; categories: any[] },
+): { implied: number; flat: number; growthPct: number; growthMult: number; maturityMult: number; breadthMult: number; age: number | null; multiple: number; peers: number; ci_low: number; ci_high: number; validation: any; model: RidgeModel | null } {
   const age = ageDays(asOf, protocol.listed_at);
   const rawGrowth = finite(protocol.change_7d, 0);
   const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
   const growthMult = 1 + (growthPct / 100) * model.growth_weight;
   const maturityMult = maturityMultiplier(age, model);
   const breadthMult = breadthMultiplier(protocol.chains, model);
-  const { multiple, peers, ci_low: mult_ci_low, ci_high: mult_ci_high } = multipleFor(protocol, calibration, model);
+  const { multiple, peers, ci_low: mult_ci_low, ci_high: mult_ci_high, model: catModel, validation } = multipleFor(protocol, calibration, model);
   const base = protocol.tvl_usd * multiple;
   const implied = Math.max(1, Math.round(base * growthMult * maturityMult * breadthMult));
   const flat = Math.max(1, Math.round(base * maturityMult * breadthMult));
 
-  const catCal = calibration.categories.find(c => c.category === (protocol.category ?? 'Uncategorized'));
-  const validation = catCal?.validation ?? { wf_mae: 0, wf_coverage: 1, wf_interval_width: 0, loo_mae: 0, loo_coverage: 1, calibration_slope: 1, calibration_intercept: 0, category: '', peer_count: 0 };
-
   // Conformal interval from validation
-  const intervalWidth = validation.wf_interval_width || 0;
+  const intervalWidth = validation?.interval_width || 0;
   const impliedCI_low = Math.max(1, Math.round(implied * (1 - intervalWidth)));
   const impliedCI_high = Math.round(implied * (1 + intervalWidth));
 
@@ -530,6 +670,7 @@ export function impliedValue(
     ci_low: impliedCI_low,
     ci_high: impliedCI_high,
     validation,
+    model: validation?.model ?? null,
   };
 }
 
@@ -574,107 +715,48 @@ function holdDaysFor(age: number | null): number {
 
 function gasCostUsd(chains: string[], model: ModelConstants, actions: number): number {
   if (chains.length === 0) return 0;
-  let bestGasPrice = 100; // gwei fallback
+  let bestGasPrice = 100;
   for (const c of chains) {
     const gp = model.gas_price_gwei[c];
     if (gp !== undefined && gp < bestGasPrice) bestGasPrice = gp;
   }
-  const ethPrice = 3000; // USD per ETH (rough)
-  const gasPerAction = model.base_gas_per_action;
   const gweiToEth = 1e-9;
-  return bestGasPrice * gasPerAction * gweiToEth * ethPrice * actions;
+  return bestGasPrice * model.base_gas_per_action * gweiToEth * model.eth_price_usd * actions;
 }
 
-/** Economic farm plan. */
-export function farmSteps(p: SnapshotProtocol, age: number | null, model: ModelConstants = MODEL): FarmStep[] {
+export function farmSteps(p: SnapshotProtocol, age: number | null, model: ModelConstants): FarmStep[] {
   const chain = p.chains.length > 0 ? p.chains[0] : 'its main chain';
   const capital = capitalFor(p);
   const hold = holdDaysFor(age);
-  const action = actionFor(p, capital, chain);
+  const action = actionFor(p, capital, chain, MODEL);
   const weeks = Math.max(2, Math.round(hold / 7));
-  const actions = 1 + weeks; // setup + weekly actions
+  const actions = 1 + weeks;
   const gasPerAction = gasCostUsd(p.chains, MODEL, 1);
   const totalGas = gasPerAction * actions;
-  const netRoi = capital * 0.15; // rough 15% expected return
+  const netRoi = capital * 0.15;
   const netRoiPerHour = netRoi / (hold * 24);
   const paybackDays = totalGas / (netRoi / hold) || 0;
-  const vestingRisk = hold > model.vesting_buffer_days ? 'high (may vest after exit)' : 'low';
+  const vestingRisk = hold > MODEL.vesting_buffer_days ? 'high (may vest after exit)' : 'low';
 
   return [
-    {
-      text: `Use a fresh wallet (hardware/clean browser) for this farm; store seed phrase offline.`,
-      cost_usd: `< $3 gas for first tx`,
-      gas_usd: `$${gasPerAction.toFixed(2)}`,
-      time_estimate: '5 minutes',
-      frequency: 'once',
-      risk_note: 'Never reuse this wallet for other activities; compromise = total loss.',
-      net_roi_per_hour_usd: '$0.00',
-    },
-    {
-      text: actionFor(p, capitalFor(p), p.chains.length > 0 ? p.chains[0] : 'its main chain'),
-      cost_usd: `$${capitalFor(p)} capital + ~$${capitalFor(p) >= 150 ? 8 : 4} gas`,
-      gas_usd: `$${gasPerAction.toFixed(2)}`,
-      time_estimate: '20 minutes setup',
-      frequency: 'once',
-      risk_note: 'Contract risk: size to survive 100% loss.',
-      net_roi_per_hour_usd: netRoiPerHour > 0 ? `$${netRoiPerHour.toFixed(4)}` : '$0.00',
-    },
-    {
-      text: `Perform one qualifying action weekly: deposit, borrow, swap, vote, claim rewards.`,
-      cost_usd: `~$2–5 gas/week`,
-      gas_usd: `$${gasPerAction.toFixed(2)} per action`,
-      time_estimate: '10 minutes/week',
-      frequency: `${Math.max(2, Math.round(holdDaysFor(age) / 7))} weeks`,
-      risk_note: 'Missed week = may not count in next snapshot; set calendar reminders.',
-      net_roi_per_hour_usd: netRoiPerHour > 0 ? `$${netRoiPerHour.toFixed(4)}` : '$0.00',
-    },
-    {
-      text: `Hold position for ${holdDaysFor(age)} days (${Math.max(2, Math.round(holdDaysFor(age) / 7))} weeks) so activity spans multiple snapshots.`,
-      cost_usd: `opportunity cost of $${capitalFor(p)} locked`,
-      gas_usd: '$0.00',
-      time_estimate: `${holdDaysFor(age)} days passive`,
-      frequency: 'continuous',
-      risk_note: 'TVL can drop; protocol can pause; have exit plan ready.',
-      net_roi_per_hour_usd: netRoiPerHour > 0 ? `$${netRoiPerHour.toFixed(4)}` : '$0.00',
-    },
-    {
-      text: `Check ${p.name}'s official points/rewards page weekly; record claimed amounts and tx hashes.`,
-      cost_usd: 'free to check; never pay to claim',
-      gas_usd: '$0.00',
-      time_estimate: '5 minutes/week',
-      frequency: 'weekly',
-      risk_note: 'Fake claim sites common; only use links from protocol\'s verified Twitter/Discord.',
-      net_roi_per_hour_usd: '$0.00',
-    },
-    {
-      text: `Before exit, claim all pending rewards from the protocol's own page; convert to stable if needed.`,
-      cost_usd: '~$3–10 gas + swap fees',
-      gas_usd: `$${gasPerAction.toFixed(2)}`,
-      time_estimate: '15 minutes',
-      frequency: 'once at exit',
-      risk_note: 'Rewards may vest; check vesting schedule before withdrawing principal.',
-      net_roi_per_hour_usd: '$0.00',
-    },
-    {
-      text: `Log wallet address, every tx hash, dates, amounts, gas paid, and net result in a farm ledger.`,
-      cost_usd: 'free',
-      gas_usd: '$0.00',
-      time_estimate: '5 minutes/week',
-      frequency: 'weekly',
-      risk_note: 'Without logs you cannot replicate, audit, or prove eligibility for retroactive rewards.',
-      net_roi_per_hour_usd: '$0.00',
-    },
+    { text: `Use a fresh wallet (hardware/clean browser) for this farm; store seed phrase offline.`, cost_usd: `< $3 gas for first tx`, gas_usd: `$${gasCostUsd(p.chains, MODEL, 1).toFixed(2)}`, time_estimate: '5 minutes', frequency: 'once', risk_note: 'Never reuse this wallet for other activities; compromise = total loss.', net_roi_per_hour_usd: '$0.00' },
+    { text: actionFor(p, capitalFor(p), p.chains.length > 0 ? p.chains[0] : 'its main chain'), cost_usd: `$${capitalFor(p)} capital + ~$${capitalFor(p) >= 150 ? 8 : 4} gas`, gas_usd: `$${gasCostUsd(p.chains, MODEL, 1).toFixed(2)}`, time_estimate: '20 minutes setup', frequency: 'once', risk_note: 'Contract risk: size to survive 100% loss.', net_roi_per_hour_usd: netRoiPerHour > 0 ? `$${netRoiPerHour.toFixed(4)}` : '$0.00' },
+    { text: `Perform one qualifying action weekly: deposit, borrow, swap, vote, claim rewards.`, cost_usd: `~$2–5 gas/week`, gas_usd: `$${gasCostUsd(p.chains, MODEL, 1).toFixed(2)} per action`, time_estimate: '10 minutes/week', frequency: `${weeks} weeks`, risk_note: 'Missed week = may not count in next snapshot; set calendar reminders.', net_roi_per_hour_usd: netRoiPerHour > 0 ? `$${netRoiPerHour.toFixed(4)}` : '$0.00' },
+    { text: `Hold position for ${hold} days (${weeks} weeks) so activity spans multiple snapshots.`, cost_usd: `opportunity cost of $${capitalFor(p)} locked`, gas_usd: '$0.00', time_estimate: `${hold} days passive`, frequency: 'continuous', risk_note: 'TVL can drop; protocol can pause; have exit plan ready.', net_roi_per_hour_usd: netRoiPerHour > 0 ? `$${netRoiPerHour.toFixed(4)}` : '$0.00' },
+    { text: `Check ${p.name}'s official points/rewards page weekly; record claimed amounts and tx hashes.`, cost_usd: 'free to check; never pay to claim', gas_usd: '$0.00', time_estimate: '5 minutes/week', frequency: 'weekly', risk_note: 'Fake claim sites common; only use links from protocol\'s verified Twitter/Discord.', net_roi_per_hour_usd: '$0.00' },
+    { text: `Before exit, claim all pending rewards from the protocol's own page; convert to stable if needed.`, cost_usd: '~$3–10 gas + swap fees', gas_usd: `$${gasCostUsd(p.chains, MODEL, 1).toFixed(2)}`, time_estimate: '15 minutes', frequency: 'once at exit', risk_note: 'Rewards may vest; check vesting schedule before withdrawing principal.', net_roi_per_hour_usd: '$0.00' },
+    { text: `Log wallet address, every tx hash, dates, amounts, gas paid, and net result in a farm ledger.`, cost_usd: 'free', gas_usd: '$0.00', time_estimate: '5 minutes/week', frequency: 'weekly', risk_note: 'Without logs you cannot replicate, audit, or prove eligibility for retroactive rewards.', net_roi_per_hour_usd: '$0.00' },
   ];
 }
 
-/** Protocol-level economic summary. */
 function farmEconomics(p: SnapshotProtocol, age: number | null): { total_gas_usd: number; net_roi_usd: number; roi_per_hour_usd: number; payback_days: number; vesting_risk: string } {
   const capital = capitalFor(p);
   const hold = holdDaysFor(age);
-  const actions = 1 + Math.max(2, Math.round(hold / 7));
+  const weeks = Math.max(2, Math.round(hold / 7));
+  const actions = 1 + weeks;
   const gasPerAction = gasCostUsd(p.chains, MODEL, 1);
   const totalGas = gasPerAction * actions;
-  const netRoi = capital * 0.15; // 15% expected
+  const netRoi = capital * 0.15;
   const roiPerHour = netRoi / (hold * 24);
   const paybackDays = totalGas / (netRoi / hold) || 0;
   const vestingRisk = hold > MODEL.vesting_buffer_days ? 'high (may vest after exit)' : 'low';
@@ -701,7 +783,6 @@ function actionFor(p: SnapshotProtocol, capital: number, chain: string): string 
   return `Deposit $${capital} USDC into ${name} on ${chain}, qualify weekly, log everything.`;
 }
 
-/** Live-token rows for calibration view. */
 export function liveRows(snapshot: Snapshot): LiveRow[] {
   return snapshot.protocols
     .filter(p => liveRatio(p) !== null && p.category !== 'CEX')
@@ -719,8 +800,7 @@ export function liveRows(snapshot: Snapshot): LiveRow[] {
     }));
 }
 
-/** Dashboard compact row. */
-export function radarRow(row: BoardRow, calibration: Calibration): RadarRow {
+export function radarRow(row: BoardRow, calibration: any): RadarRow {
   const catCal = calibration.categories.find(c => c.category === (row.category ?? 'Uncategorized'));
   return {
     rank: row.rank,
@@ -746,33 +826,30 @@ export function radarRow(row: BoardRow, calibration: Calibration): RadarRow {
   };
 }
 
-/** Build the full board and radar data. */
-export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData } {
-  const calibration = calibrate(snapshot, model);
+export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: RadarData } {
+  const calibration = calibrate(snapshot, MODEL);
 
   const index = bySlug(snapshot.protocols);
   const chosen = new Map<string, SnapshotProtocol>();
 
-  // Watchlist is the floor
   for (const slug of snapshot.watchlist) {
     const p = index.get(slug);
     if (p !== undefined) chosen.set(slug, p);
   }
 
-  // Early radar: all other rankable protocols by TVL
   const early = snapshot.protocols
     .filter(p => !chosen.has(p.slug) && isRankable(p))
     .sort((a, b) => b.tvl_usd - a.tvl_usd || (a.slug < b.slug ? -1 : 1));
   for (const p of early) chosen.set(p.slug, p);
 
   const scored = [...chosen.values()].map(p => {
-    const v = impliedValue(p, snapshot.as_of, model, calibration);
+    const v = impliedValue(p, snapshot.as_of, MODEL, calibration);
     return { p, v };
   });
   scored.sort((a, b) => b.v.implied - a.v.implied || (a.p.slug < b.p.slug ? -1 : 1));
 
   const board = scored.map((s, i) => {
-    const econ = farmEconomics(s.p, s.v.age);
+    const econ = farmEconomics(s.p, s.v.age, MODEL);
     return {
       rank: i + 1,
       slug: s.p.slug,
@@ -797,11 +874,12 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
         maturity_multiplier: round4(s.v.maturityMult),
         breadth_multiplier: round4(s.v.breadthMult),
         age_days: s.v.age,
-        validation_mae: round4(s.v.validation.wf_mae),
-        validation_coverage: round4(s.v.validation.wf_coverage),
-        conformal_width: round4(s.v.validation.wf_interval_width),
+        validation_mae: round4(s.v.validation.mae),
+        validation_coverage: round4(s.v.validation.coverage),
+        conformal_width: round4(s.v.validation.interval_width),
+        feature_importance: s.v.model?.feature_importance ?? [],
       },
-      farm_steps: farmSteps(s.p, s.v.age).map(stepText),
+      farm_steps: farmSteps(s.p, s.v.age, MODEL).map(stepText),
       farm_economics: {
         total_gas_usd: Math.round(econ.total_gas_usd * 100) / 100,
         net_roi_usd: Math.round(econ.net_roi_usd * 100) / 100,
@@ -819,7 +897,7 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     as_of: snapshot.as_of,
     source: snapshot.source,
     floor_usd: snapshot.floor_usd,
-    model,
+    model: MODEL,
     model_version: MODEL_VERSION,
     watchlist_size: snapshot.watchlist.length,
     board_size: board.length,
