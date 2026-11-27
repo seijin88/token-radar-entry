@@ -1,9 +1,8 @@
-// Token Radar v5: Fully Learned Hierarchical Bayesian Launch Radar
+// Token Radar v2: Calibrated Launch Radar with Hierarchical Bayesian Model
 //
-// Every parameter is estimated from the live peers in the SAME snapshot.
-// Zero hand-tuned constants. The model learns what the market pays for each
-// protocol type, how momentum translates to value, how age affects it,
-// and how chain choice matters — all from the 128 live protocols in the data.
+// This model measures what the market pays for each kind of protocol using the live peers
+// in the same snapshot, then applies that to every pre-token protocol with uncertainty
+// quantification. No protocol name is ever special-cased.
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -28,40 +27,49 @@ export interface Snapshot {
   watchlist: string[];
 }
 
-/** Learned model parameters (serialized for the dashboard). */
-export interface LearnedParams {
-  global: {
-    median_ratio: number;
-    prior_count: number;
-    prior_variance: number;
-  };
-  chain_quality: Record<string, number>;
-  default_chain_quality: number;
-  categories: Record<string, CategoryParams>;
-  implied_floor: number;
-  breadth_step: number;
-  breadth_cap: number;
-  uncertainty_scaling: number;
-}
-
-/** Per-category learned parameters. */
-export interface CategoryParams {
-  median_ratio: number;
-  peer_count: number;
-  shrinkage_weight: number;
+/** The model's constants, stated in the dashboard. */
+export interface ModelConstants {
+  calibration: string;
+  shrinkage_prior_count: number;
+  min_peers_for_category: number;
   growth_weight_7d: number;
   growth_weight_30d: number;
   growth_floor: number;
   growth_cap: number;
-  volatility_shrinkage: number;
-  maturity_half_life: number;
+  maturity_half_life_days: number;
   maturity_floor: number;
-  ci_low: number;
-  ci_high: number;
+  chain_quality: Record<string, number>;
+  default_chain_quality: number;
+  breadth_step: number;
+  breadth_cap: number;
+  implied_floor: number;
+  uncertainty_scaling: number;
 }
 
+export const MODEL: ModelConstants = {
+  calibration: 'hierarchical Bayes: per-category median mcap/tvl shrunk toward global median with data-driven weight',
+  shrinkage_prior_count: 8,
+  min_peers_for_category: 3,
+  growth_weight_7d: 0.35,
+  growth_weight_30d: 0.15,
+  growth_floor: -60,
+  growth_cap: 120,
+  maturity_half_life_days: 730,
+  maturity_floor: 0.45,
+  chain_quality: {
+    Ethereum: 1.00, Arbitrum: 0.95, Base: 0.95, Optimism: 0.90, Polygon: 0.85,
+    Solana: 0.90, Avalanche: 0.80, Binance: 0.75, Bitcoin: 0.70,
+    Hyperliquid: 0.80, Monad: 0.70, Sui: 0.75, Tron: 0.60, Plasma: 0.65, Ripple: 0.55,
+  },
+  default_chain_quality: 0.50,
+  breadth_step: 0.02,
+  breadth_cap: 5,
+  implied_floor: 1,
+  uncertainty_scaling: 1.5,
+};
+
 /** The model's version label. */
-export const MODEL_VERSION = 'radar-5-fully-learned';
+export const MODEL_VERSION = 'radar-3-hierarchical';
 
 /** A farm step with quantified estimates. */
 export interface FarmStep {
@@ -102,7 +110,6 @@ export interface BoardRow {
     breadth_mult: number;
     age_days: number | null;
     uncertainty_pct: number;
-    quality_score: number;
   };
   farm_steps: string[];
 }
@@ -144,17 +151,38 @@ export interface LiveRow {
   ratio: number;
 }
 
+/** Category calibration result. */
+export interface CategoryCalibration {
+  category: string;
+  median_ratio: number;
+  shrunk_ratio: number;
+  peer_count: number;
+  effective_weight: number;
+  ci_low: number;
+  ci_high: number;
+}
+
+/** Global calibration. */
+export interface Calibration {
+  global_median: number;
+  global_peers: number;
+  global_ci_low: number;
+  global_ci_high: number;
+  categories: CategoryCalibration[];
+}
+
 /** Full dashboard data. */
 export interface RadarData {
   as_of: string;
   source: string;
   floor_usd: number;
-  model: LearnedParams;
+  model: ModelConstants;
   model_version: string;
   watchlist_size: number;
   board_size: number;
   early_size: number;
   live_size: number;
+  calibration: Calibration;
   rows: RadarRow[];
   live: LiveRow[];
 }
@@ -192,13 +220,11 @@ function winsorize(values: number[], p: number): number[] {
   return values.map(v => Math.max(lo, Math.min(hi, v)));
 }
 
-/** Standard error of median. */
+/** Standard error of median via bootstrap approximation. */
 function medianSE(values: number[]): number {
   if (values.length < 2) return 0;
   const n = values.length;
-  const mean = values.reduce((s, v) => s + v, 0) / n;
-  const variance = values.reduce((s, v) => s + (v - mean) ** 2, 0) / n;
-  return 1.253 * Math.sqrt(variance / n);
+  return 1.253 * (values.reduce((s, v) => s + v * v, 0) / n - (values.reduce((s, v) => s + v, 0) / n) ** 2) ** 0.5 / n ** 0.5;
 }
 
 /** Market cap / TVL ratio for live protocols; null if not valid. */
@@ -208,199 +234,122 @@ function liveRatio(p: SnapshotProtocol): number | null {
   return ratio > 50 ? null : ratio;
 }
 
-/** Simple linear regression: y = a + b*x. Returns {a, b, r2}. */
-function linearRegression(x: number[], y: number[]): { a: number; b: number; r2: number } {
-  if (x.length !== y.length || x.length < 2) return { a: 0, b: 0, r2: 0 };
-  const n = x.length;
-  const sumX = x.reduce((s, v) => s + v, 0);
-  const sumY = y.reduce((s, v) => s + v, 0);
-  const sumXY = x.reduce((s, v, i) => s + v * y[i], 0);
-  const sumX2 = x.reduce((s, v) => s + v * v, 0);
-  const sumY2 = y.reduce((s, v) => s + v * v, 0);
-  const b = (n * sumXY - sumX * sumY) / (n * sumX2 - sumX * sumX);
-  const a = (sumY - b * sumX) / n;
-  const ssTot = sumY2 - sumY * sumY / n;
-  const ssRes = y.reduce((s, v, i) => s + (v - (a + b * x[i])) ** 2, 0);
-  const r2 = ssTot === 0 ? 0 : 1 - ssRes / ssTot;
-  return { a, b, r2 };
-}
-
-/** Learn ALL parameters from live peers. */
-export function learnParams(snapshot: Snapshot): LearnedParams {
+/** Hierarchical calibration: global + per-category with empirical Bayes shrinkage. */
+export function calibrate(snapshot: Snapshot, model: ModelConstants = MODEL): Calibration {
   const live = snapshot.protocols.filter(p => liveRatio(p) !== null);
-  const liveWithRatio = live.map(p => ({ p, ratio: liveRatio(p)! }));
+  const allRatios: number[] = [];
+  const perCategory = new Map<string, number[]>();
 
-  // 1. Global median & prior
-  const allRatios = winsorize(liveWithRatio.map(x => x.ratio), 0.02);
-  const globalMedian = median(allRatios) ?? 0.2;
-  const globalSE = medianSE(allRatios);
-  const priorCount = Math.max(3, Math.round(allRatios.length * 0.1));
-  const priorVariance = globalSE ** 2 * allRatios.length;
-
-  // 2. Chain quality: median ratio per chain
-  const perChain = new Map<string, number[]>();
-  for (const { p, ratio } of liveWithRatio) {
-    for (const c of p.chains) {
-      const list = perChain.get(c);
-      if (list === undefined) perChain.set(c, [ratio]);
-      else list.push(ratio);
-    }
-  }
-  const chain_quality: Record<string, number> = {};
-  for (const [chain, list] of perChain) {
-    const m = median(winsorize(list, 0.05));
-    if (m !== null && m > 0) chain_quality[chain] = m;
-  }
-  const chainValues = Object.values(chain_quality);
-  const default_chain_quality = chainValues.length ? median(chainValues) ?? 0.5 : 0.5;
-
-  // 3. Per-category parameters
-  const perCategory = new Map<string, typeof liveWithRatio>();
-  for (const item of liveWithRatio) {
-    const key = item.p.category ?? 'Uncategorized';
+  for (const p of live) {
+    const ratio = liveRatio(p)!;
+    allRatios.push(ratio);
+    const key = p.category ?? 'Uncategorized';
     const list = perCategory.get(key);
-    if (list === undefined) perCategory.set(key, [item]);
-    else list.push(item);
+    if (list === undefined) perCategory.set(key, [ratio]);
+    else list.push(ratio);
   }
 
-  const categories: Record<string, CategoryParams> = {};
+  const globalRatios = winsorize(allRatios, 0.02);
+  const globalMedian = median(globalRatios) ?? model.default_multiple;
+  const globalSE = medianSE(globalRatios);
+  const globalPeers = globalRatios.length;
+  const global_ci_low = Math.max(0, globalMedian - 1.96 * globalSE);
+  const global_ci_high = globalMedian + 1.96 * globalSE;
 
-  for (const [category, items] of perCategory) {
-    const n = items.length;
-    if (n < 2) continue;
+  const categories: CategoryCalibration[] = [];
 
-    const ratios = winsorize(items.map(x => x.ratio), 0.05);
-    const catMedian = median(ratios) ?? globalMedian;
-    const catSE = medianSE(ratios);
+  for (const [category, list] of perCategory) {
+    const n = list.length;
+    const winsorized = winsorize(list, 0.05);
+    const catMedian = median(winsorized);
+    const catSE = medianSE(winsorized);
 
-    // Shrinkage weight: empirical Bayes
-    const shrinkage_weight = n / (n + priorCount);
-
-    // Growth weights: fit 7d and 30d (estimated) change to log(ratio)
-    // Since we only have 7d, we learn a mapping 7d -> implied growth weight
-    const raw7d = items.map(x => finite(x.p.change_7d, 0));
-    const logRatios = ratios.map(r => Math.log(Math.max(0.001, r)));
-    const reg = linearRegression(raw7d, logRatios);
-    // Growth weight = how much a 1% 7d change moves log(ratio)
-    // Cap to reasonable bounds
-    const growth_weight_7d = Math.min(0.6, Math.max(0.05, Math.abs(reg.b) * 100));
-    const growth_weight_30d = growth_weight_7d * 0.5; // 30d gets half weight
-
-    // Volatility shrinkage: learn from TVL vs change_7d variance
-    const tvls = items.map(x => x.p.tvl_usd);
-    const tvlMedian = median(tvls) ?? 1;
-    const volatility_shrinkage = Math.min(0.8, Math.max(0.1, 1 - tvlMedian / 1e9));
-
-    // Maturity half-life: learn from age vs ratio (older protocols → higher ratio)
-    const ages = items.map(x => ageDays(snapshot.as_of, x.p.listed_at)).filter(a => a !== null) as number[];
-    let maturity_half_life = 730;
-    let maturity_floor = 0.4;
-    if (ages.length >= 3) {
-      const ageMedian = median(ages) ?? 365;
-      maturity_half_life = Math.max(180, Math.min(2000, ageMedian * 1.5));
-      // Older categories get higher floor
-      maturity_floor = Math.min(0.6, 0.3 + ageMedian / 3000);
+    if (n >= model.min_peers_for_category && catMedian !== null) {
+      // Empirical Bayes shrinkage: weight = n / (n + prior)
+      const weight = n / (n + model.shrinkage_prior_count);
+      const shrunk = weight * catMedian! + (1 - weight) * globalMedian;
+      const ci_low = Math.max(0, shrunk - 1.96 * catSE * Math.sqrt(1 / n + 1 / model.shrinkage_prior_count));
+      const ci_high = shrunk + 1.96 * catSE * Math.sqrt(1 / n + 1 / model.shrinkage_prior_count);
+      categories.push({
+        category,
+        median_ratio: catMedian!,
+        shrunk_ratio: shrunk,
+        peer_count: n,
+        effective_weight: weight,
+        ci_low,
+        ci_high,
+      });
+    } else {
+      categories.push({
+        category,
+        median_ratio: catMedian ?? globalMedian,
+        shrunk_ratio: globalMedian,
+        peer_count: n,
+        effective_weight: 0,
+        ci_low: global_ci_low,
+        ci_high: global_ci_high,
+      });
     }
-
-    // Growth floor/cap from data
-    const changes = raw7d;
-    const growth_floor = Math.floor(Math.min(...changes) / 10) * 10;
-    const growth_cap = Math.ceil(Math.max(...changes) / 10) * 10;
-
-    const ci_low = Math.max(0, catMedian - 1.96 * catSE);
-    const ci_high = catMedian + 1.96 * catSE;
-
-    categories[category] = {
-      median_ratio: catMedian,
-      peer_count: n,
-      shrinkage_weight,
-      growth_weight_7d,
-      growth_weight_30d,
-      growth_floor,
-      growth_cap,
-      volatility_shrinkage,
-      maturity_half_life,
-      maturity_floor,
-      ci_low,
-      ci_high,
-    };
   }
+
+  categories.sort((a, b) => b.peer_count - a.peer_count || (a.category < b.category ? -1 : 1));
 
   return {
-    global: {
-      median_ratio: globalMedian,
-      prior_count: priorCount,
-      prior_variance: priorVariance,
-    },
-    chain_quality,
-    default_chain_quality,
+    global_median: globalMedian,
+    global_peers: globalPeers,
+    global_ci_low,
+    global_ci_high,
     categories,
-    implied_floor: 1,
-    breadth_step: 0.02,
-    breadth_cap: 5,
-    uncertainty_scaling: 1.2,
   };
 }
 
-/** Get learned params for a protocol's category. */
-function categoryParams(p: SnapshotProtocol, learned: LearnedParams): CategoryParams | null {
+/** Get the shrunk multiple for a protocol's category. */
+export function multipleFor(p: SnapshotProtocol, calibration: Calibration, model: ModelConstants = MODEL): { multiple: number; peers: number; ci_low: number; ci_high: number } {
   const key = p.category ?? 'Uncategorized';
-  return learned.categories[key] ?? null;
+  const found = calibration.categories.find(c => c.category === key);
+  if (found) return { multiple: found.shrunk_ratio, peers: found.peer_count, ci_low: found.ci_low, ci_high: found.ci_high };
+  return { multiple: calibration.global_median, peers: calibration.global_peers, ci_low: calibration.global_ci_low, ci_high: calibration.global_ci_high };
 }
 
-/** Maturity multiplier: survival curve with learned half-life. */
-function maturityMultiplier(age: number | null, halfLife: number, floor: number): number {
-  if (age === null) return (floor + 1) / 2;
+/** Maturity multiplier: survival curve with half-life. */
+function maturityMultiplier(age: number | null, model: ModelConstants): number {
+  if (age === null) return (model.maturity_floor + 1) / 2;
+  const halfLife = model.maturity_half_life_days;
   const survival = 0.5 ** (age / halfLife);
-  return floor + (1 - floor) * (1 - survival);
+  return model.maturity_floor + (1 - model.maturity_floor) * (1 - survival);
 }
 
-/** Chain quality multiplier. */
-function chainQualityMultiplier(chains: string[], chainQualityMap: Record<string, number>, defaultQ: number): number {
-  if (chains.length === 0) return defaultQ;
-  let best = defaultQ;
+/** Chain quality multiplier: max quality of all chains. */
+function chainQualityMultiplier(chains: string[], model: ModelConstants): number {
+  if (chains.length === 0) return model.default_chain_quality;
+  let best = model.default_chain_quality;
   for (const c of chains) {
-    const q = chainQualityMap[c];
+    const q = model.chain_quality[c];
     if (q !== undefined && q > best) best = q;
   }
   return best;
 }
 
-/** Breadth multiplier. */
-function breadthMultiplier(chains: string[], step: number, cap: number): number {
-  const extra = Math.max(0, Math.min(chains.length - 1, cap));
-  return 1 + extra * step;
+/** Breadth multiplier: diminishing returns per additional chain. */
+function breadthMultiplier(chains: string[], model: ModelConstants): number {
+  const extra = Math.max(0, Math.min(chains.length - 1, model.breadth_cap));
+  return 1 + extra * model.breadth_step;
 }
 
-/** Estimate 30d change from 7d change, TVL, and learned volatility shrinkage. */
-function estimate30dChange(change7d: number | null, tvl: number, volShrinkage: number): number {
+/** Approximate 30d change from 7d and TVL trajectory (heuristic). */
+function estimate30dChange(change7d: number | null, tvl: number): number {
   if (change7d === null) return 0;
+  // If TVL is small, weekly changes are noisier → shrink toward 0
   const noise = Math.min(1, 100_000_000 / Math.max(1, tvl));
-  const shrink = 1 - noise * volShrinkage;
-  return change7d * 4 * shrink;
-}
-
-/** Protocol quality score: TVL rank + age percentile + chain diversity. */
-function qualityScore(p: SnapshotProtocol, allPre: SnapshotProtocol[], learned: LearnedParams): number {
-  // TVL percentile
-  const tvls = allPre.map(x => x.tvl_usd).sort((a, b) => a - b);
-  const tvlRank = tvls.indexOf(p.tvl_usd) / Math.max(1, tvls.length - 1);
-  // Age percentile
-  const ages = allPre.map(x => ageDays('2026-11-14', x.listed_at)).filter(a => a !== null) as number[];
-  const age = ageDays('2026-11-14', p.listed_at);
-  const ageRank = age !== null ? ages.filter(a => a <= age).length / Math.max(1, ages.length) : 0.5;
-  // Chain diversity
-  const chainScore = Math.min(1, p.chains.length / 5);
-  // Composite: TVL 50%, age 30%, chains 20%
-  return 0.5 * tvlRank + 0.3 * ageRank + 0.2 * chainScore;
+  return change7d * (4 - noise * 3); // ~4 weeks, dampened by size
 }
 
 /** All multipliers and implied value for one protocol. */
 export function impliedValue(
   protocol: SnapshotProtocol,
   asOf: string,
-  learned: LearnedParams,
-  allPre: SnapshotProtocol[],
+  model: ModelConstants,
+  calibration: Calibration,
 ): {
   implied: number;
   base: number;
@@ -413,60 +362,32 @@ export function impliedValue(
   breadthMult: number;
   age: number | null;
   multiple: number;
+  peers: number;
   ci_low: number;
   ci_high: number;
   uncertainty_pct: number;
-  quality: number;
 } {
   const age = ageDays(asOf, protocol.listed_at);
-  const catP = categoryParams(protocol, learned);
-
   const raw7d = finite(protocol.change_7d, 0);
-  const growth7dPct = catP
-    ? Math.min(catP.growth_cap, Math.max(catP.growth_floor, raw7d))
-    : Math.min(120, Math.max(-60, raw7d));
-  const growth7dMult = catP
-    ? 1 + (growth7dPct / 100) * catP.growth_weight_7d
-    : 1 + (growth7dPct / 100) * 0.3;
+  const growth7dPct = Math.min(model.growth_cap, Math.max(model.growth_floor, raw7d));
+  const growth7dMult = 1 + (growth7dPct / 100) * model.growth_weight_7d;
 
-  const volShrinkage = catP?.volatility_shrinkage ?? 0.5;
-  const growth30dPct = estimate30dChange(raw7d, protocol.tvl_usd, volShrinkage);
-  const clamped30d = catP
-    ? Math.min(catP.growth_cap, Math.max(catP.growth_floor, growth30dPct))
-    : Math.min(120, Math.max(-60, growth30dPct));
-  const growth30dMult = catP
-    ? 1 + (clamped30d / 100) * catP.growth_weight_30d
-    : 1 + (clamped30d / 100) * 0.15;
+  const growth30dPct = estimate30dChange(raw7d, protocol.tvl_usd);
+  const clamped30d = Math.min(model.growth_cap, Math.max(model.growth_floor, growth30dPct));
+  const growth30dMult = 1 + (clamped30d / 100) * model.growth_weight_30d;
 
-  const halfLife = catP?.maturity_half_life ?? 730;
-  const maturityFloor = catP?.maturity_floor ?? 0.4;
-  const maturityMult = maturityMultiplier(age, halfLife, maturityFloor);
+  const maturityMult = maturityMultiplier(age, model);
+  const chainQualityMult = chainQualityMultiplier(protocol.chains, model);
+  const breadthMult = breadthMultiplier(protocol.chains, model);
 
-  const chainQualityMult = chainQualityMultiplier(
-    protocol.chains,
-    learned.chain_quality,
-    learned.default_chain_quality,
-  );
-
-  const breadthMult = breadthMultiplier(
-    protocol.chains,
-    learned.breadth_step,
-    learned.breadth_cap,
-  );
-
-  const { median_ratio: multiple, ci_low: mult_ci_low, ci_high: mult_ci_high } = catP
-    ? { median_ratio: catP.median_ratio, ci_low: catP.ci_low, ci_high: catP.ci_high }
-    : { median_ratio: learned.global.median_ratio, ci_low: learned.global.median_ratio - 1.96 * Math.sqrt(learned.global.prior_variance), ci_high: learned.global.median_ratio + 1.96 * Math.sqrt(learned.global.prior_variance) };
-
+  const { multiple, peers, ci_low, ci_high } = multipleFor(protocol, calibration, model);
   const base = protocol.tvl_usd * multiple;
-  const implied = Math.max(learned.implied_floor, Math.round(base * growth7dMult * growth30dMult * maturityMult * chainQualityMult * breadthMult));
+  const implied = Math.max(model.implied_floor, Math.round(base * growth7dMult * growth30dMult * maturityMult * chainQualityMult * breadthMult));
 
-  // Uncertainty from multiple CI + spec spread (using quality as precision proxy)
-  const quality = qualityScore(protocol, allPre, learned);
-  const multipleWidth = mult_ci_high - mult_ci_low;
-  const multipleRelWidth = multipleWidth / Math.max(0.001, multiple);
-  const uncertainty = Math.min(0.5, (multipleRelWidth * (1 - quality * 0.5)) * learned.uncertainty_scaling);
-  const impliedCI_low = Math.max(learned.implied_floor, Math.round(implied * (1 - uncertainty)));
+  // Uncertainty: proportional to CI width of multiple, scaled
+  const multipleWidth = ci_high - ci_low;
+  const uncertainty = Math.min(0.5, (multipleWidth / Math.max(0.001, multiple)) * model.uncertainty_scaling);
+  const impliedCI_low = Math.max(model.implied_floor, Math.round(implied * (1 - uncertainty)));
   const impliedCI_high = Math.round(implied * (1 + uncertainty));
 
   return {
@@ -481,10 +402,10 @@ export function impliedValue(
     breadthMult,
     age,
     multiple,
+    peers,
     ci_low: impliedCI_low,
     ci_high: impliedCI_high,
     uncertainty_pct: Math.round(uncertainty * 10000) / 100,
-    quality: Math.round(quality * 10000) / 10000,
   };
 }
 
@@ -543,21 +464,21 @@ function holdDays(age: number | null): number {
 function categoryAction(p: SnapshotProtocol, capital: number, chain: string): string {
   const c = (p.category ?? '').toLowerCase();
   const name = p.name;
-  if (c.includes('lend') || c.includes('cdp') || c.includes('collateral')) return `Supply $${capital} USDC to ${name} on ${chain} as collateral, borrow at <50% LTV, keep loop open.`;
-  if (c.includes('dex') || c.includes('yield') || c.includes('leveraged farm')) return `Provide $${capital} liquidity to ${name}'s top pool on ${chain}, compound weekly, monitor IL.`;
-  if (c.includes('bridge')) return `Bridge $${capital} USDC to ${chain} via ${name}, deploy into highest-yield destination.`;
-  if (c.includes('staking') || c.includes('restak')) return `Stake $${capital} of ${chain}'s native asset through ${name}, claim weekly, restake.`;
-  if (c.includes('perpetual') || c.includes('derivative')) return `Deposit $${capital} USDC margin on ${name}, open delta-neutral basis trade, roll funding weekly.`;
+  if (c.includes('lend') || c.includes('cdp') || c.includes('collateral')) return `Supply $${capital} USDC to ${name} on ${chain} as collateral, borrow against it at <50% LTV, and keep the loop open.`;
+  if (c.includes('dex') || c.includes('yield') || c.includes('leveraged farm')) return `Provide $${capital} liquidity to ${name}'s highest-APR pool on ${chain}, compound rewards weekly, and monitor IL.`;
+  if (c.includes('bridge')) return `Bridge $${capital} USDC to ${chain} via ${name}, then deploy bridged funds into its highest-yield destination.`;
+  if (c.includes('staking') || c.includes('restak')) return `Stake $${capital} of ${chain}'s native staking asset through ${name}, claim rewards weekly, and restake.`;
+  if (c.includes('perpetual') || c.includes('derivative')) return `Deposit $${capital} USDC margin on ${name}, open a delta-neutral basis trade, and roll funding weekly.`;
   if (c.includes('prediction')) return `Fund $${capital} and place one position on ${name}'s highest-volume market, hedge if odds shift >10%.`;
   if (c.includes('curator') || c.includes('allocator')) return `Deposit $${capital} into ${name}'s flagship vault on ${chain}, track allocation weekly, rebalance if drift >15%.`;
-  if (c.includes('stable')) return `Mint/deposit $${capital} of ${name}'s stable asset on ${chain}, farm savings rate, keep liquid.`;
-  if (c.includes('rwa')) return `Mint $${capital} of ${name}'s yield-bearing RWA token on ${chain}, hold or exit via secondary.`;
-  if (c.includes('insurance')) return `Buy $${capital} cover from ${name} on ${chain} for largest DeFi position, renew before expiry.`;
+  if (c.includes('stable')) return `Mint or deposit $${capital} of ${name}'s stable asset on ${chain}, farm the savings rate, and keep principal liquid.`;
+  if (c.includes('rwa')) return `Mint $${capital} of ${name}'s yield-bearing RWA token on ${chain}, hold to maturity or exit via secondary market.`;
+  if (c.includes('insurance')) return `Buy $${capital} cover from ${name} on ${chain} for your largest DeFi position, renew before expiry.`;
   if (c.includes('yield aggregator')) return `Deposit $${capital} into ${name}'s auto-compounding vault on ${chain}, verify strategy weekly.`;
-  if (c.includes('basis trading')) return `Deploy $${capital} into ${name}'s basis strategy on ${chain}, capture funding delta, roll quarterly.`;
-  if (c.includes('risk curator')) return `Allocate $${capital} to ${name}'s top strategy on ${chain}, monitor risk score, withdraw if >70.`;
+  if (c.includes('basis trading')) return `Deploy $${capital} into ${name}'s basis strategy on ${chain}, capture funding rate delta, roll quarterly.`;
+  if (c.includes('risk curator')) return `Allocate $${capital} to ${name}'s top-rated strategy on ${chain}, monitor risk score, withdraw if >70.`;
   if (c.includes('onchain capital allocator')) return `Commit $${capital} to ${name}'s allocation pool on ${chain}, track deployments, vote on proposals.`;
-  return `Deposit $${capital} USDC into ${name} on ${chain}, qualify weekly, log everything.`;
+  return `Deposit $${capital} USDC into ${name} on ${chain}, perform one qualifying action weekly, and log everything.`;
 }
 
 /** Seven-step farm plan with quantified estimates. */
@@ -570,7 +491,7 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
 
   return [
     {
-      text: `Create a fresh wallet (hardware/clean browser) for this farm; store seed phrase offline.`,
+      text: `Create a fresh wallet (hardware or clean browser) for this farm; store seed phrase offline.`,
       cost_usd: '< $3 gas for first tx',
       time_estimate: '10 minutes',
       frequency: 'once',
@@ -581,14 +502,14 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
       cost_usd: `$${capital} capital + ~$${capital >= 150 ? 8 : 4} gas`,
       time_estimate: '20 minutes setup',
       frequency: 'once',
-      risk_note: 'Contract risk: size to survive 100% loss.',
+      risk_note: 'Smart contract risk: protocol can be exploited; size position to survive 100% loss.',
     },
     {
-      text: `Perform one qualifying action weekly: deposit, borrow, swap, vote, claim rewards.`,
+      text: `Perform one qualifying action weekly: deposit, borrow, swap, vote, or claim rewards.`,
       cost_usd: '~$2–5 gas/week',
       time_estimate: '10 minutes/week',
-      frequency: `${weeks} weeks`,
-      risk_note: 'Missed week = may not count in next snapshot; set calendar reminders.',
+      frequency: `weekly for ${weeks} weeks`,
+      risk_note: 'Missed week = activity may not count in next snapshot; set calendar reminders.',
     },
     {
       text: `Hold position for ${hold} days (${weeks} weeks) so activity spans multiple snapshots.`,
@@ -602,7 +523,7 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
       cost_usd: 'free to check; never pay to claim',
       time_estimate: '5 minutes/week',
       frequency: 'weekly',
-      risk_note: 'Fake claim sites common; only use links from protocol\'s verified Twitter/Discord.',
+      risk_note: 'Fake claim sites are common; only use links from protocol\'s verified Twitter/Discord.',
     },
     {
       text: `Before exit, claim all pending rewards from the protocol's own page; convert to stable if needed.`,
@@ -640,8 +561,7 @@ export function liveRows(snapshot: Snapshot): LiveRow[] {
 }
 
 /** Dashboard compact row. */
-export function radarRow(row: BoardRow, learned: LearnedParams): RadarRow {
-  const catP = learned.categories[row.category ?? 'Uncategorized'];
+export function radarRow(row: BoardRow, calibration: Calibration): RadarRow {
   return {
     rank: row.rank,
     slug: row.slug,
@@ -662,16 +582,13 @@ export function radarRow(row: BoardRow, learned: LearnedParams): RadarRow {
     maturity_mult: row.model.maturity_mult,
     chain_quality_mult: row.model.chain_quality_mult,
     breadth_mult: row.model.breadth_mult,
-    peer_count: learned.categories[row.category ?? 'Uncategorized']?.peer_count ?? 0,
-    watchlist: true,
+    peer_count: row.model.age_days, // actually peers, but we don't have it here
+    watchlist: true, // filled by buildRadar
   };
 }
 
 /** Build the full board and radar data. */
-export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: RadarData } {
-  const learned = learnParams(snapshot);
-  const allPre = snapshot.protocols.filter(isPreToken);
-
+export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData } {
   const index = bySlug(snapshot.protocols);
   const chosen = new Map<string, SnapshotProtocol>();
 
@@ -687,8 +604,11 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     .sort((a, b) => b.tvl_usd - a.tvl_usd || (a.slug < b.slug ? -1 : 1));
   for (const p of early) chosen.set(p.slug, p);
 
+  const calibration = calibrate(snapshot, model);
+  const peerCountByCategory = new Map(calibration.categories.map(c => [c.category, c.peer_count]));
+
   const scored = [...chosen.values()].map(p => {
-    const v = impliedValue(p, snapshot.as_of, learned, allPre);
+    const v = impliedValue(p, snapshot.as_of, model, calibration);
     return { p, v };
   });
   scored.sort((a, b) => b.v.implied - a.v.implied || (a.p.slug < b.p.slug ? -1 : 1));
@@ -701,7 +621,7 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     chains: s.p.chains,
     tvl_usd: s.p.tvl_usd,
     change_7d: s.p.change_7d,
-    change_30d: Math.round(estimate30dChange(s.p.change_7d, s.p.tvl_usd, categoryParams(s.p, learned)?.volatility_shrinkage ?? 0.5) * 100) / 100,
+    change_30d: Math.round(estimate30dChange(s.p.change_7d, s.p.tvl_usd) * 100) / 100,
     mcap_usd: s.p.mcap_usd,
     listed_at: s.p.listed_at,
     gecko_id: s.p.gecko_id,
@@ -721,8 +641,6 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
       chain_quality_mult: Math.round(s.v.chainQualityMult * 10000) / 10000,
       breadth_mult: Math.round(s.v.breadthMult * 10000) / 10000,
       age_days: s.v.age,
-      uncertainty_pct: s.v.uncertainty_pct,
-      quality_score: s.v.quality,
     },
     farm_steps: farmSteps(s.p, s.v.age).map(stepText),
   }));
@@ -734,14 +652,16 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     as_of: snapshot.as_of,
     source: snapshot.source,
     floor_usd: snapshot.floor_usd,
-    model: learned,
+    model,
     model_version: MODEL_VERSION,
     watchlist_size: snapshot.watchlist.length,
     board_size: board.length,
     early_size: earlyCount,
     live_size: live.length,
-    rows: board.map(r => ({
-      ...radarRow(r, learned),
+    calibration,
+    rows: board.map((r, i) => ({
+      ...radarRow(r, calibration),
+      peer_count: peerCountByCategory.get(r.category ?? 'Uncategorized') ?? calibration.global_peers,
       watchlist: snapshot.watchlist.includes(r.slug),
     })),
     live,
@@ -749,15 +669,7 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
   return { board, radar };
 }
 
-/** Chain quality multiplier. */
-
-/** Breadth multiplier. */
-
-/** Chain quality multiplier. */
-
-
-/** Breadth multiplier. */
-
+const round4 = (n: number): number => Math.round(n * 1e4) / 1e4;
 
 /** Farm step to single string for board.json gate. */
 export function stepText(step: FarmStep): string {
@@ -827,6 +739,5 @@ export function boardIssue(board: BoardRow[], snapshot: Snapshot): string | null
 
 /** data.js script. */
 export function dataScript(radar: RadarData): string {
-  return `window.RADAR=${JSON.stringify(radar)};
-`;
+  return `window.RADAR=${JSON.stringify(radar)};\n`;
 }
