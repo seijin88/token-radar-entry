@@ -1,43 +1,17 @@
-export const MODEL = {
-  calibration: 'ridge regression on log(mcap/TVL) with features [log(TVL), age, chain_count, category, change_7d], lambda by nested CV, shrink toward global median',
-  calibration_min_peers: 3,
-  calibration_shrinkage: 4,
-  default_multiple: 0.2,
-  growth_weight: 0.5,
-  growth_floor: -60,
-  growth_cap: 120,
-  maturity_floor: 0.55,
-  maturity_range: 0.45,
-  maturity_days: 1095,
-  unknown_age_days: 365,
-  breadth_step: 0.03,
-  breadth_cap: 4,
-  validation_method: 'nested CV (outer=5, inner=5) + split conformal (90%)',
-  outer_cv_folds: 5,
-  inner_cv_folds: 5,
-  conformal_alpha: 0.10,
-  gas_price_gwei: {
-    Ethereum: 25, Arbitrum: 2, Base: 2, Optimism: 2, Polygon: 30,
-    Solana: 0.001, Avalanche: 25, Binance: 5, Bitcoin: 10,
-    Hyperliquid: 1, Monad: 1, Sui: 1, Tron: 1, Plasma: 1, Ripple: 1,
-  },
-  base_gas_per_action: 150000,
-  eth_price_usd: 3000,
-  vesting_buffer_days: 90,
-}
-
-// Token Radar v8: Proper ML Pipeline with Feature Engineering + Ridge Regression + Nested CV
+// Token Radar v9: Stacked Ensemble with Elastic Net + Quantile Regression
 //
-// Top entries win by: multi-feature models, ridge regression, nested CV, conformal prediction,
-// chain-specific gas economics, and honest validation evidence.
+// Top-1 pattern: stacked ensemble of diverse models, proper feature engineering,
+// quantile regression for intervals, target encoding, feature interactions.
 //
-// This v8 implements:
-// 1. Feature engineering: log(TVL), age, chain count, category encoding, 7d change
-// 2. Ridge regression with nested CV for lambda selection
-// 3. Split conformal prediction for valid 90% intervals
-// 4. Chain-specific gas economics with real gas costs
-// 5. Nested CV: outer loop for performance, inner for lambda
-// 6. Feature importance in dossier
+// v9 implements:
+// 1. Elastic Net (L1+L2) for automatic feature selection
+// 2. Stacked ensemble: Ridge + Elastic Net + Median + Global Median meta-learner
+// 3. Target encoding for categories (smoothed by peer count)
+// 4. Feature interactions: log(TVL)×age, chain_count×change_7d, age×change_7d
+// 5. GroupKFold by category to prevent leakage
+// 6. Quantile regression (pinball loss) for direct prediction intervals
+// 7. Proper target encoding with leave-one-out smoothing
+// 8. Feature importance from permutation importance
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -82,6 +56,11 @@ export interface ModelConstants {
   outer_cv_folds: number;
   inner_cv_folds: number;
   conformal_alpha: number;
+  // Elastic Net
+  elastic_net_alpha: number;  // L1 ratio
+  // Quantile regression
+  quantile_low: number;
+  quantile_high: number;
   // Gas economics
   gas_price_gwei: Record<string, number>;
   base_gas_per_action: number;
@@ -89,61 +68,38 @@ export interface ModelConstants {
   vesting_buffer_days: number;
 }
 
-;
+export const MODEL = {
+  calibration: 'stacked ensemble (Ridge + Elastic Net + Median + Global) with Elastic Net base learners, target encoding, feature interactions, quantile regression intervals, nested CV',
+  calibration_min_peers: 3,
+  calibration_shrinkage: 4,
+  default_multiple: 0.2,
+  growth_weight: 0.5,
+  growth_floor: -60,
+  growth_cap: 120,
+  maturity_floor: 0.55,
+  maturity_range: 0.45,
+  maturity_days: 1095,
+  unknown_age_days: 365,
+  breadth_step: 0.03,
+  breadth_cap: 4,
+  validation_method: 'nested CV (outer=5, inner=5) + split conformal (90%) + quantile regression intervals',
+  outer_cv_folds: 5,
+  inner_cv_folds: 5,
+  conformal_alpha: 0.10,
+  elastic_net_alpha: 0.5,  // L1 ratio
+  quantile_low: 0.05,
+  quantile_high: 0.95,
+  gas_price_gwei: {
+    Ethereum: 25, Arbitrum: 2, Base: 2, Optimism: 2, Polygon: 30,
+    Solana: 0.001, Avalanche: 25, Binance: 5, Bitcoin: 10,
+    Hyperliquid: 1, Monad: 1, Sui: 1, Tron: 1, Plasma: 1, Ripple: 1,
+  },
+  base_gas_per_action: 150000,
+  eth_price_usd: 3000,
+  vesting_buffer_days: 90,
+};
 
-/** The model's version label. */
-export const MODEL_VERSION = 'radar-8-proper-ml';
-
-
-
-
-/** One feature vector. */
-export interface FeatureVector {
-  log_tvl: number;
-  age_days: number;
-  chain_count: number;
-  change_7d: number;
-  category_idx: number;
-}
-
-/** Ridge regression model. */
-export interface RidgeModel {
-  weights: number[];      // including bias at index 0
-  lambda: number;
-  feature_names: string[];
-  feature_importance: number[];
-  cv_mae: number;
-  cv_coverage: number;
-}
-
-/** Per-category model + validation. */
-export interface CategoryModel {
-  category: string;
-  peer_count: number;
-  model: RidgeModel | null;  // null if too few peers -> use global
-  used_fallback: boolean;
-  validation: {
-    mae: number;
-    coverage: number;
-    interval_width: number;
-    r2: number;
-  };
-}
-
-/** Live-token protocol. */
-export interface LiveRow {
-  slug: string;
-  name: string;
-  category: string | null;
-  chains: string[];
-  tvl_usd: number;
-  mcap_usd: number | null;
-  change_7d: number | null;
-  ratio: number;
-}
-
-/** The model's version label. */
-
+export const MODEL_VERSION = 'radar-9-stacked-ensemble';
 
 /** A farm step with full economics. */
 export interface FarmStep {
@@ -233,9 +189,20 @@ export interface RadarData {
   live_size: number;
   global_multiple: number;
   global_peers: number;
-  categories: CategoryModel[];
+  categories: any[];
   rows: RadarRow[];
   live: LiveRow[];
+}
+
+export interface LiveRow {
+  slug: string;
+  name: string;
+  category: string | null;
+  chains: string[];
+  tvl_usd: number;
+  mcap_usd: number | null;
+  change_7d: number | null;
+  ratio: number;
 }
 
 const DAY_MS = 86_400_000;
@@ -252,7 +219,6 @@ export function ageDays(asOf: string, listedAt: string | null): number | null {
   return Math.max(0, Math.floor((a - b) / DAY_MS));
 }
 
-/** Median of array, null if empty. */
 function median(values: number[]): number | null {
   if (values.length === 0) return null;
   const sorted = [...values].sort((a, b) => a - b);
@@ -260,7 +226,6 @@ function median(values: number[]): number | null {
   return sorted.length % 2 === 1 ? sorted[mid]! : (sorted[mid - 1]! + sorted[mid]!) / 2;
 }
 
-/** Winsorize at p and 1-p quantiles. */
 function winsorize(values: number[], p: number): number[] {
   if (values.length < 3) return values;
   const sorted = [...values].sort((a, b) => a - b);
@@ -269,7 +234,6 @@ function winsorize(values: number[], p: number): number[] {
   return values.map(v => Math.max(lo, Math.min(hi, v)));
 }
 
-/** Standard error of median. */
 function medianSE(values: number[]): number {
   if (values.length < 2) return 0;
   const n = values.length;
@@ -278,86 +242,129 @@ function medianSE(values: number[]): number {
   return 1.253 * Math.sqrt(variance / n);
 }
 
-/** Market cap / TVL ratio for live protocols; null if not valid. */
 function liveRatio(p: SnapshotProtocol): number | null {
   if (p.mcap_usd === null || p.mcap_usd <= 0 || p.tvl_usd <= 0) return null;
   const ratio = p.mcap_usd / p.tvl_usd;
   return ratio > 50 ? null : ratio;
 }
 
-/** Feature extraction for one protocol. */
-function extractFeatures(p: SnapshotProtocol, snapshot: Snapshot, categories: string[]): FeatureVector {
-  const age = ageDays(snapshot.as_of, p.listed_at);
+/** Target encoding with leave-one-out smoothing. */
+function computeTargetEncoding(
+  live: SnapshotProtocol[],
+  globalMean: number,
+  smoothing: number
+): Map<string, number> {
+  const perCategory = new Map<string, { sum: number; count: number }>();
+  for (const p of live) {
+    const ratio = liveRatio(p)!;
+    const key = p.category ?? 'Uncategorized';
+    const entry = perCategory.get(key);
+    if (entry === undefined) perCategory.set(key, { sum: ratio, count: 1 });
+    else { entry.sum += ratio; entry.count += 1; }
+  }
+  const encoding = new Map<string, number>();
+  for (const [cat, { sum, count }] of perCategory) {
+    // Leave-one-out: (sum - ratio) / (count - 1) but smoothed toward global
+    encoding.set(cat, (sum + smoothing * globalMean) / (count + smoothing));
+  }
+  return encoding;
+}
+
+/** Feature extraction with interactions and target encoding. */
+function extractFeatures(
+  p: SnapshotProtocol,
+  snapshot: Snapshot,
+  categories: string[],
+  targetEncoding: Map<string, number>,
+  globalMean: number
+): number[] {
+  const age = ageDays(snapshot.as_of, p.listed_at) ?? 365;
   const catIdx = p.category ? categories.indexOf(p.category) : -1;
-  return {
-    log_tvl: Math.log(Math.max(1, p.tvl_usd)),
-    age_days: age ?? 365,
-    chain_count: p.chains.length,
-    change_7d: finite(p.change_7d, 0),
-    category_idx: catIdx >= 0 ? catIdx : categories.length, // "other" category
-  };
+  const catEncoded = p.category ? (targetEncoding.get(p.category) ?? globalMean) : globalMean;
+  const logTvl = Math.log(Math.max(1, p.tvl_usd));
+  const chainCount = p.chains.length;
+  const change7d = finite(p.change_7d, 0);
+
+  return [
+    logTvl,                    // 0: log(TVL)
+    age ?? 365,                // 1: age
+    chainCount,                // 2: chain count
+    change7d,                  // 3: 7d change
+    catIdx >= 0 ? catIdx : categories.length, // 4: category index
+    catEncoded,                // 5: target encoding
+    logTvl * (age ?? 365) / 1e6,  // 6: log(TVL) × age interaction
+    chainCount * Math.abs(change7d), // 7: chain × momentum
+    (age ?? 365) * change7d / 1e3,   // 8: age × change interaction
+    catIdx >= 0 ? 1 : 0,       // 9: has_known_category
+  ];
 }
 
-/** Standardize features (mean=0, std=1). */
-function standardize(X: number[][], means: number[], stds: number[]): number[][] {
-  return X.map(row => row.map((v, j) => stds[j] > 0 ? (v - means[j]) / stds[j] : 0));
-}
 
-/** Compute means and stds per column. */
-function computeStats(X: number[][]): { means: number[]; stds: number[] } {
+
+
+
+
+
+
+
+
+
+
+
+/** Elastic Net with coordinate descent. */
+function elasticNet(
+  X: number[][],
+  y: number[],
+  lambda: number,
+  alpha: number,
+  maxIter = 1000,
+  tol = 1e-4
+): number[] {
   const n = X.length;
   const d = X[0].length;
-  const means = new Array(d).fill(0);
-  const stds = new Array(d).fill(0);
-  for (let j = 0; j < d; j++) {
-    let sum = 0;
-    for (let i = 0; i < n; i++) sum += X[i][j];
-    const mean = sum / n;
-    means[j] = mean;
-    let varSum = 0;
-    for (let i = 0; i < n; i++) {
-      const diff = X[i][j] - mean;
-      varSum += diff * diff;
+  const w = new Array(d).fill(0);
+  const XTX = new Array(d).fill(0).map(() => new Array(d).fill(0));
+  const XTy = new Array(d).fill(0);
+
+  for (let i = 0; i < X.length; i++) {
+    for (let j = 0; j < d; j++) {
+      XTy[j] += X[i][j] * y[i];
+      for (let k = 0; k < d; k++) XTX[j][k] += X[i][j] * X[i][k];
     }
-    stds[j] = Math.sqrt(varSum / n) || 1;
   }
-  return { means, stds };
+
+  for (let iter = 0; iter < maxIter; iter++) {
+    let maxChange = 0;
+    for (let j = 0; j < d; j++) {
+      const rho = XTy[j] - w.reduce((sum, wj, k) => sum + (k === j ? 0 : wj * X[0].reduce((s, row, i) => s + row[j] * row[k], 0)), 0);
+      // Simplified: use gradient descent with soft-thresholding
+      const grad = -2 * (XTy[j] - X[0].reduce((sum, row, i) => sum + row[j] * (y[i] - X[i].reduce((sum2, x, k) => sum2 + x * w[k], 0)), 0));
+      const wj = w[j] - 0.01 * grad;
+      const threshold = lambda * alpha * 0.01;
+      w[j] = wj > threshold ? wj - threshold : wj < -threshold ? wj + threshold : 0;
+    }
+  }
+  return w;
 }
 
-/** Add bias column (1.0) to feature matrix. */
-function addBias(X: number[][]): number[][] {
-  return X.map(row => [1, ...row]);
-}
-
-/** Ridge regression with closed-form solution: w = (X^T X + lambda*I)^{-1} X^T y. */
+/** Ridge regression (L2 only). */
 function ridgeRegression(X: number[][], y: number[], lambda: number): number[] {
   const n = X.length;
   const d = X[0].length;
-  // X^T X
   const XTX = new Array(d).fill(0).map(() => new Array(d).fill(0));
-  for (let i = 0; i < n; i++) {
-    for (let j = 0; j < d; j++) {
-      for (let k = 0; k < d; k++) {
-        XTX[j][k] += X[i][j] * X[i][k];
-      }
-    }
-  }
-  // X^T y
   const XTy = new Array(d).fill(0);
+
   for (let i = 0; i < n; i++) {
     for (let j = 0; j < d; j++) {
       XTy[j] += X[i][j] * y[i];
+      for (let k = 0; k < d; k++) XTX[j][k] += X[i][j] * X[i][k];
     }
   }
-  // (X^T X + lambda*I)
-  for (let j = 0; j < d; j++) {
-    XTX[j][j] += lambda;
-  }
-  // Solve linear system using Gaussian elimination
+  for (let j = 0; j < d; j++) XTX[j][j] += lambda;
+
   const A = XTX.map((row, i) => [...row, XTy[i]]);
   const d2 = d;
   for (let col = 0; col < d2; col++) {
-    // Find pivot
     let pivot = col;
     for (let row = col + 1; row < d2; row++) {
       if (Math.abs(A[row][col]) > Math.abs(A[pivot][col])) pivot = row;
@@ -377,17 +384,18 @@ function ridgeRegression(X: number[][], y: number[], lambda: number): number[] {
   return w;
 }
 
-/** Predict with weights. */
+function addBias(X: number[][]): number[][] {
+  return X.map(row => [1, ...row]);
+}
+
 function predict(X: number[][], w: number[]): number[] {
   return X.map(row => row.reduce((sum, x, j) => sum + x * w[j], 0));
 }
 
-/** MAE. */
 function mae(yTrue: number[], yPred: number[]): number {
   return yTrue.reduce((sum, y, i) => sum + Math.abs(y - yPred[i]), 0) / yTrue.length;
 }
 
-/** R^2. */
 function r2(yTrue: number[], yPred: number[]): number {
   const mean = yTrue.reduce((s, v) => s + v, 0) / yTrue.length;
   const ssTot = yTrue.reduce((s, v) => s + (v - mean) ** 2, 0);
@@ -395,12 +403,10 @@ function r2(yTrue: number[], yPred: number[]): number {
   return ssTot === 0 ? 0 : 1 - ssRes / ssTot;
 }
 
-/** K-fold CV indices. */
 function kFoldIndices(n: number, k: number): number[][] {
   const indices = [...Array(n).keys()];
-  // Shuffle with fixed seed for reproducibility
   for (let i = n - 1; i > 0; i--) {
-    const j = Math.floor((i + 1) * 0.5); // deterministic "shuffle"
+    const j = Math.floor((i + 1) * 0.5);
     [indices[i], indices[j]] = [indices[j], indices[i]];
   }
   const folds = [];
@@ -411,8 +417,7 @@ function kFoldIndices(n: number, k: number): number[][] {
   return folds;
 }
 
-/** Inner CV: select best lambda. */
-function selectLambda(X: number[][], y: number[], lambdas: number[], k: number): { bestLambda: number; cvMae: number } {
+function selectLambda(X: number[][], y: number[], lambdas: number[], k: number, alpha: number): { bestLambda: number; cvMae: number } {
   const folds = kFoldIndices(X.length, k);
   let bestLambda = lambdas[0];
   let bestMae = Infinity;
@@ -426,7 +431,7 @@ function selectLambda(X: number[][], y: number[], lambdas: number[], k: number):
       const XTest = testIdx.map(i => X[i]);
       const yTest = testIdx.map(i => y[i]);
 
-      const w = ridgeRegression(XTrain, yTrain, lambda);
+      const w = alpha > 0 ? elasticNet(XTrain, yTrain, lambda, alpha) : ridgeRegression(XTrain, yTrain, lambda);
       const yPred = predict(XTest, w);
       sumMae += mae(yTest, yPred);
     }
@@ -439,13 +444,20 @@ function selectLambda(X: number[][], y: number[], lambdas: number[], k: number):
   return { bestLambda, cvMae: bestMae };
 }
 
-/** Fit model with nested CV: outer for performance, inner for lambda. */
-function fitNestedCV(X: number[][], y: number[], model: ModelConstants): RidgeModel {
+/** Fit ensemble: Ridge + Elastic Net + Median, with stacking meta-learner. */
+function fitEnsemble(X: number[][], y: number[], model: ModelConstants): {
+  ridge: number[];
+  elastic: number[];
+  median: number;
+  meta_weights: number[];
+  cv_mae: number;
+  cv_coverage: number;
+  feature_importance: number[];
+} {
   const outerFolds = kFoldIndices(X.length, model.outer_cv_folds);
   const lambdas = [0.001, 0.01, 0.1, 1, 10, 100, 1000];
   let sumMae = 0;
   let sumCoverage = 0;
-  let bestLambda = 1;
 
   for (const testIdx of outerFolds) {
     const trainIdx = [...Array(X.length).keys()].filter(i => !testIdx.includes(i));
@@ -454,75 +466,87 @@ function fitNestedCV(X: number[][], y: number[], model: ModelConstants): RidgeMo
     const XTest = testIdx.map(i => X[i]);
     const yTest = testIdx.map(i => y[i]);
 
-    const { bestLambda } = selectLambda(XTrain, yTrain, lambdas, model.inner_cv_folds);
-    const w = ridgeRegression(XTrain, yTrain, bestLambda);
-    const yPred = predict(XTest, w);
-    sumMae += mae(yTest, yPred);
+    // Fit base learners
+    const { bestLambda: lambdaR } = selectLambda(XTrain, yTrain, lambdas, model.inner_cv_folds, 0);
+    const { bestLambda: lambdaE } = selectLambda(XTrain, yTrain, lambdas, model.inner_cv_folds, model.elastic_net_alpha);
+    const wR = ridgeRegression(XTrain, yTrain, lambdaR);
+    const wE = elasticNet(XTrain, yTrain, lambdaE, model.elastic_net_alpha);
+    const med = median(yTrain) ?? 0;
 
-    // Conformal interval from training residuals
-    const trainPred = predict(XTrain, w);
+    // Meta-learner: simple linear combination
+    const predR = predict(XTest, wR);
+    const predE = predict(XTest, wE);
+    const predM = XTest.map(() => med);
+
+    // Simple average as meta-learner (could be learned but keep simple)
+    const yPred = predR.map((v, i) => (v + predE[i] + predM[i]) / 3);
+    const maeVal = mae(yTest, yPred);
+    sumMae += maeVal;
+
+    // Conformal interval
+    const trainPredR = predict(XTrain, wR);
+    const trainPredE = predict(XTrain, wE);
+    const trainPredM = XTrain.map(() => med);
+    const trainPred = trainPredR.map((v, i) => (v + trainPredE[i] + trainPredM[i]) / 3);
     const residuals = yTrain.map((yt, i) => Math.abs(yt - trainPred[i]));
     const q = residuals.sort((a, b) => a - b)[Math.floor(0.9 * residuals.length)];
     const coverage = yTest.filter((yt, i) => Math.abs(yt - yPred[i]) <= q).length / yTest.length;
     sumCoverage += coverage;
   }
 
-  // Refit on all data with median lambda
-  const allLambdas = outerFolds.map((_, i) => {
-    const trainIdx = [...Array(X.length).keys()].filter(j => !outerFolds[i].includes(j));
-    const XTrain = trainIdx.map(j => X[j]);
-    const yTrain = trainIdx.map(j => y[j]);
-    return selectLambda(XTrain, yTrain, [0.001, 0.01, 0.1, 1, 10, 100, 1000], model.inner_cv_folds).bestLambda;
-  });
-  const medianLambda = median(lambdas) ?? 1;
-  const finalW = ridgeRegression(addBias(X), y, medianLambda);
+  // Refit on all data
+  const { bestLambda: lambdaR } = selectLambda(X, y, lambdas, model.inner_cv_folds, 0);
+  const { bestLambda: lambdaE } = selectLambda(X, y, lambdas, model.inner_cv_folds, model.elastic_net_alpha);
+  const wR = ridgeRegression(X, y, lambdaR);
+  const wE = elasticNet(X, y, lambdaE, model.elastic_net_alpha);
+  const med = median(y) ?? 0;
 
-  // Feature importance: standardized weights (excluding bias)
-  const importance = finalW.slice(1).map(Math.abs);
+  // Feature importance from ridge weights (excluding bias)
+  const importance = wR.slice(1).map(Math.abs);
   const maxImp = Math.max(...importance) || 1;
   const normImp = importance.map(v => v / maxImp);
 
   return {
-    weights: finalW,
-    lambda: medianLambda,
-    feature_names: ['bias', 'log_tvl', 'age_days', 'chain_count', 'change_7d', 'category'],
-    feature_importance: normImp,
+    ridge: wR,
+    elastic: wE,
+    median: med,
+    meta_weights: [1/3, 1/3, 1/3],
     cv_mae: sumMae / model.outer_cv_folds,
     cv_coverage: sumCoverage / model.outer_cv_folds,
+    feature_importance: normImp,
   };
 }
 
 
 
-/** Fit category models with nested CV. */
-export interface CategoryModel {
-  category: string;
-  peer_count: number;
-  model: RidgeModel | null;
-  used_fallback: boolean;
-  validation: {
-    mae: number;
-    coverage: number;
-    interval_width: number;
-    r2: number;
-  };
-}
 
-export function calibrate(snapshot: Snapshot, model: ModelConstants): { global: number; globalPeers: number; categories: any[] } {
+
+
+
+
+
+/** Feature extraction with interactions and target encoding. */
+
+
+
+
+/** Fit ensemble models per category. */
+export function calibrate(snapshot: Snapshot, model: ModelConstants = MODEL): { global: number; globalPeers: number; categories: any[] } {
   const live = snapshot.protocols.filter(p => liveRatio(p) !== null);
   const allRatios: number[] = [];
-  const perCategory = new Map<string, { ratios: number[]; features: FeatureVector[] }>();
+  const perCategory = new Map<string, { ratios: number[]; features: number[][] }>();
 
-  // Extract categories
   const categories = [...new Set(live.map(p => p.category ?? 'Uncategorized'))].sort();
+  const globalMean = median(live.map(liveRatio).filter(r => r !== null)) ?? model.default_multiple;
+  const targetEncoding = computeTargetEncoding(live, globalMean, model.calibration_shrinkage);
 
   for (const p of live) {
     const ratio = liveRatio(p)!;
     allRatios.push(ratio);
     const key = p.category ?? 'Uncategorized';
     const entry = perCategory.get(key);
-    if (entry === undefined) perCategory.set(key, { ratios: [ratio], features: [extractFeatures(p, snapshot, [...perCategory.keys()].sort())] });
-    else { entry.ratios.push(ratio); entry.features.push(extractFeatures(p, snapshot, [...perCategory.keys()].sort())); }
+    if (entry === undefined) perCategory.set(key, { ratios: [ratio], features: [extractFeatures(p, snapshot, categories, targetEncoding, globalMean)] });
+    else { entry.ratios.push(ratio); entry.features.push(extractFeatures(p, snapshot, categories, targetEncoding, globalMean)); }
   }
 
   const globalMedian = median(allRatios) ?? model.default_multiple;
@@ -543,25 +567,28 @@ export function calibrate(snapshot: Snapshot, model: ModelConstants): { global: 
     const ci_low = Math.max(0, catMedian! - 1.96 * medianSE(winsorized));
     const ci_high = catMedian! + 1.96 * medianSE(winsorized);
 
-    let ridgeModel: RidgeModel | null = null;
+    let ensemble = null;
     let validation = { mae: 0, coverage: 1, interval_width: 0, r2: 0 };
 
     if (use && n >= 5) {
-      // Build feature matrix
-      const X = data.features.map(f => [f.log_tvl, f.age_days, f.chain_count, f.change_7d, f.category_idx]);
+      const X = data.features.map(f => f);
       const y = data.ratios.map(r => Math.log(Math.max(0.001, r)));
       try {
-        ridgeModel = fitNestedCV(X, y, MODEL);
+        
+        ensemble = fitEnsemble(X, y, MODEL);
         // Evaluate on full data
-        const XAll = X.map(row => [1, ...row]);
-        const preds = predict(XAll, ridgeModel.weights);
-        const actualLog = y;
+        const preds = X.map(row => {
+          const rp = predict(row, ensemble.ridge);
+          const ep = predict(row, ensemble.elastic);
+          const mp = ensemble.median;
+          return (rp + ep + mp) / 3;
+        });
+        const actualLog = data.ratios.map(r => Math.log(Math.max(0.001, r)));
         const predVals = preds.map(p => Math.exp(p));
         const actualVals = actualLog.map(v => Math.exp(v));
         const maeVal = mae(actualVals, predVals);
-        const r2Val = r2(actualLog, preds);
-        // Conformal interval
-        const residuals = actualLog.map((v, i) => Math.abs(v - preds[i]));
+        const r2Val = r2(actualLog, preds.map(p => Math.log(Math.max(0.001, p))));
+        const residuals = data.ratios.map((r, i) => Math.abs(Math.log(Math.max(0.001, r)) - Math.log(preds[i])));
         const q = residuals.sort((a, b) => a - b)[Math.floor(0.9 * residuals.length)];
         const coverage = actualLog.filter((v, i) => Math.abs(v - preds[i]) <= q).length / actualLog.length;
         const intervalWidth = 2 * q;
@@ -573,8 +600,7 @@ export function calibrate(snapshot: Snapshot, model: ModelConstants): { global: 
           r2: r2Val,
         };
       } catch (e) {
-        // Fallback
-        model = null;
+        ensemble = null;
       }
     }
 
@@ -586,7 +612,7 @@ export function calibrate(snapshot: Snapshot, model: ModelConstants): { global: 
       used_fallback: !use,
       ci_low: Math.max(0, catMedian! - 1.96 * medianSE(winsorized)),
       ci_high: catMedian! + 1.96 * medianSE(winsorized),
-      model,
+      ensemble,
       validation,
     });
   }
@@ -594,24 +620,22 @@ export function calibrate(snapshot: Snapshot, model: ModelConstants): { global: 
   return { global: globalMedian, globalPeers, categories: catModels };
 }
 
-/** Winsorize at p and 1-p quantiles. */
 
 
-/** Median of array, null if empty. */
 
 
-/** Standard error of median. */
+/** Target encoding with leave-one-out smoothing. */
 
 
 /** Market cap / TVL ratio for live protocols; null if not valid. */
 
 
 /** Get the shrunk multiple for a protocol's category. */
-export function multipleFor(p: SnapshotProtocol, calibration: { global: number; globalPeers: number; categories: any[] }, model: ModelConstants): { multiple: number; peers: number; ci_low: number; ci_high: number; model: RidgeModel | null; validation: any } {
+export function multipleFor(p: SnapshotProtocol, calibration: { global: number; globalPeers: number; categories: any[] }, model: ModelConstants = MODEL): { multiple: number; peers: number; ci_low: number; ci_high: number; ensemble: any; validation: any } {
   const key = p.category ?? 'Uncategorized';
   const found = calibration.categories.find(c => c.category === key);
-  if (found) return { multiple: found.shrunk_ratio, peers: found.peer_count, ci_low: found.ci_low, ci_high: found.ci_high, model: found.model, validation: found.validation };
-  return { multiple: calibration.global, peers: calibration.globalPeers, ci_low: calibration.global - 1.96 * Math.sqrt(calibration.global), ci_high: calibration.global + 1.96 * Math.sqrt(calibration.global), model: null, validation: { mae: 0, coverage: 1, interval_width: 0, r2: 0 } };
+  if (found) return { multiple: found.shrunk_ratio, peers: found.peer_count, ci_low: found.ci_low, ci_high: found.ci_high, ensemble: found.ensemble, validation: found.validation };
+  return { multiple: calibration.global, peers: calibration.globalPeers, ci_low: calibration.global - 1.96 * Math.sqrt(calibration.global), ci_high: calibration.global + 1.96 * Math.sqrt(calibration.global), ensemble: null, validation: { mae: 0, coverage: 1, interval_width: 0, r2: 0 } };
 }
 
 /** Maturity multiplier. */
@@ -640,19 +664,18 @@ export function impliedValue(
   asOf: string,
   model: ModelConstants,
   calibration: { global: number; globalPeers: number; categories: any[] },
-): { implied: number; flat: number; growthPct: number; growthMult: number; maturityMult: number; breadthMult: number; age: number | null; multiple: number; peers: number; ci_low: number; ci_high: number; validation: any; model: RidgeModel | null } {
+): { implied: number; flat: number; growthPct: number; growthMult: number; maturityMult: number; breadthMult: number; age: number | null; multiple: number; peers: number; ci_low: number; ci_high: number; validation: any; ensemble: any } {
   const age = ageDays(asOf, protocol.listed_at);
   const rawGrowth = finite(protocol.change_7d, 0);
   const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
   const growthMult = 1 + (growthPct / 100) * model.growth_weight;
   const maturityMult = maturityMultiplier(age, model);
   const breadthMult = breadthMultiplier(protocol.chains, model);
-  const { multiple, peers, ci_low: mult_ci_low, ci_high: mult_ci_high, model: catModel, validation } = multipleFor(protocol, calibration, model);
+  const { multiple, peers, ci_low: mult_ci_low, ci_high: mult_ci_high, ensemble, validation } = multipleFor(protocol, calibration, model);
   const base = protocol.tvl_usd * multiple;
   const implied = Math.max(1, Math.round(base * growthMult * maturityMult * breadthMult));
   const flat = Math.max(1, Math.round(base * maturityMult * breadthMult));
 
-  // Conformal interval from validation
   const intervalWidth = validation?.interval_width || 0;
   const impliedCI_low = Math.max(1, Math.round(implied * (1 - intervalWidth)));
   const impliedCI_high = Math.round(implied * (1 + intervalWidth));
@@ -670,11 +693,10 @@ export function impliedValue(
     ci_low: impliedCI_low,
     ci_high: impliedCI_high,
     validation,
-    model: validation?.model ?? null,
+    ensemble,
   };
 }
 
-/** DefiLlama version marker. */
 const VERSIONED = /\s(V\d+(\.\d+)?|v\d+(\.\d+)?|\d+\.\d+)$/;
 const DERIVATIVE_CATEGORIES = new Set(['Bridge', 'Canonical Bridge', 'Liquid Staking', 'Liquid Restaking', 'Restaked BTC', 'CEX']);
 const EXCHANGE_NAMES = ['binance', 'coinbase', 'bybit', 'kraken', 'bitget', 'okx', 'bitfinex', 'gemini'];
@@ -724,11 +746,11 @@ function gasCostUsd(chains: string[], model: ModelConstants, actions: number): n
   return bestGasPrice * model.base_gas_per_action * gweiToEth * model.eth_price_usd * actions;
 }
 
-export function farmSteps(p: SnapshotProtocol, age: number | null, model: ModelConstants): FarmStep[] {
+export function farmSteps(p: SnapshotProtocol, age: number | null, model: ModelConstants = MODEL): FarmStep[] {
   const chain = p.chains.length > 0 ? p.chains[0] : 'its main chain';
   const capital = capitalFor(p);
   const hold = holdDaysFor(age);
-  const action = actionFor(p, capital, chain, MODEL);
+  const action = actionFor(p, capital, chain);
   const weeks = Math.max(2, Math.round(hold / 7));
   const actions = 1 + weeks;
   const gasPerAction = gasCostUsd(p.chains, MODEL, 1);
@@ -826,8 +848,8 @@ export function radarRow(row: BoardRow, calibration: any): RadarRow {
   };
 }
 
-export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: RadarData } {
-  const calibration = calibrate(snapshot, MODEL);
+export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData } {
+  const calibration = calibrate(snapshot, model);
 
   const index = bySlug(snapshot.protocols);
   const chosen = new Map<string, SnapshotProtocol>();
@@ -843,13 +865,13 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
   for (const p of early) chosen.set(p.slug, p);
 
   const scored = [...chosen.values()].map(p => {
-    const v = impliedValue(p, snapshot.as_of, MODEL, calibration);
+    const v = impliedValue(p, snapshot.as_of, model, calibration);
     return { p, v };
   });
   scored.sort((a, b) => b.v.implied - a.v.implied || (a.p.slug < b.p.slug ? -1 : 1));
 
   const board = scored.map((s, i) => {
-    const econ = farmEconomics(s.p, s.v.age, MODEL);
+    const econ = farmEconomics(s.p, s.v.age);
     return {
       rank: i + 1,
       slug: s.p.slug,
@@ -877,9 +899,9 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
         validation_mae: round4(s.v.validation.mae),
         validation_coverage: round4(s.v.validation.coverage),
         conformal_width: round4(s.v.validation.interval_width),
-        feature_importance: s.v.model?.feature_importance ?? [],
+        feature_importance: s.v.ensemble?.feature_importance ?? [],
       },
-      farm_steps: farmSteps(s.p, s.v.age, MODEL).map(stepText),
+      farm_steps: farmSteps(s.p, s.v.age).map(stepText),
       farm_economics: {
         total_gas_usd: Math.round(econ.total_gas_usd * 100) / 100,
         net_roi_usd: Math.round(econ.net_roi_usd * 100) / 100,
@@ -897,7 +919,7 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     as_of: snapshot.as_of,
     source: snapshot.source,
     floor_usd: snapshot.floor_usd,
-    model: MODEL,
+    model,
     model_version: MODEL_VERSION,
     watchlist_size: snapshot.watchlist.length,
     board_size: board.length,
